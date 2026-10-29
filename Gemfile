@@ -2,7 +2,7 @@ source "https://rubygems.org"
 git_source(:github) { |name| "https://github.com/#{name}.git" }
 
 # load first so environment is initialized
-gem "dotenv-rails", "= 2.8.1"
+gem "dotenv-rails", "= 3.2.0"
 
 gem "llhttp", github: "benubois/llhttp",
               branch: "memory_corruption",
