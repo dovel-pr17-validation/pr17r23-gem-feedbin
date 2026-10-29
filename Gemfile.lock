@@ -285,10 +285,10 @@ GEM
       reline (>= 0.3.8)
     debug_inspector (1.2.0)
     domain_name (0.6.20260921)
-    dotenv (2.8.1)
-    dotenv-rails (2.8.1)
-      dotenv (= 2.8.1)
-      railties (>= 3.2)
+    dotenv (3.2.0)
+    dotenv-rails (3.2.0)
+      dotenv (= 3.2.0)
+      railties (>= 6.1)
     drb (2.2.3)
     equalizer (0.0.11)
     erb (6.0.7)
@@ -729,7 +729,7 @@ DEPENDENCIES
   connection_pool (< 3)
   cuprite
   debug
-  dotenv-rails (= 2.8.1)
+  dotenv-rails (= 3.2.0)
   evernote_oauth
   faker
   feedjira!
