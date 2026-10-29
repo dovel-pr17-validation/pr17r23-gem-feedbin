@@ -1,0 +1,155 @@
+class Subscription < ApplicationRecord
+  attr_accessor :entries_count, :post_volume, :sort_data, :tag_names
+
+  belongs_to :user
+  belongs_to :feed, counter_cache: true
+
+  after_commit :mark_as_unread, on: [:create]
+
+  before_create :expire_stat_cache
+
+  after_create :add_feed_to_action
+  after_commit :remove_feed_from_action, on: [:destroy]
+
+  before_destroy :prevent_generated_destroy
+  before_destroy :mark_as_read
+  before_destroy :clear_updated_entries
+  before_destroy :untag
+
+  after_create :refresh_favicon
+
+  validate :reject_title_changes, on: :update, if: :generated?
+
+  # errors[:title] returns a freshly built array, so pushing onto it mutated a
+  # temporary and the validation always passed.
+  def reject_title_changes
+    errors.add(:title, "can not be changed") if title_changed?
+  end
+
+  enum :kind, {default: 0, generated: 1}
+  enum :view_mode, {article: 0, extract: 1, newsletter: 2}
+  enum :fix_status, {none: 0, present: 1, ignored: 2}, prefix: :fix_suggestion
+
+  # The newsletter-sender switch is routed from two places that write these
+  # same rows, so the UI's idea of the current state and the server's drift
+  # apart. Depend only on the state being asked for, never on the difference
+  # between two states.
+  def self.set_subscribed(user, feed_id, subscribed)
+    if subscribed
+      user.subscriptions.find_or_create_by(feed_id: feed_id)
+    else
+      user.subscriptions.where(feed_id: feed_id).take&.destroy
+    end
+  end
+
+  def self.create_multiple(feeds, user, valid_feed_ids)
+    @subscriptions = feeds.each_with_object([]) { |(feed_id, subscription), array|
+      feed = Feed.find(feed_id)
+      if valid_feed_ids.include?(feed.id) && subscription["subscribe"] == "1"
+        record = user.subscriptions.find_or_create_by(feed: feed)
+        # Leaving the box empty means "use the feed's own name", so store nil
+        # rather than "" — the fallback in #title only fires on nil. And an
+        # empty box must not wipe a title the user set on an earlier visit,
+        # since find_or_create_by hands back the existing row.
+        attributes = {media_only: subscription["media_only"]}
+        title = subscription["title"].to_s.strip.presence
+        attributes[:title] = title if title || record.previously_new_record?
+        record.update(attributes)
+        array.push(record)
+      end
+    }
+  end
+
+  # presence, not ||, so the rows already carrying "" recover too.
+  def title
+    self[:title].presence || feed&.title
+  end
+
+  def mark_as_unread
+    base = Entry.select(:id, :feed_id, :published, :created_at).where(feed_id: feed_id).order("published DESC")
+    entries = base.where("published > ?", Time.now.ago(2.weeks)).limit(10)
+    if entries.length == 0
+      entries = base.limit(3)
+    end
+    unread_entries = entries.map { |entry|
+      UnreadEntry.new_from_owners(user, entry)
+    }
+    UnreadEntry.import(unread_entries, validate: false, on_duplicate_key_ignore: true)
+  end
+
+  def mark_as_read
+    UnreadEntry.where(user_id: user_id, feed_id: feed_id).delete_all
+  end
+
+  # updated_entries is per-subscription state — whether it is written at all is
+  # the show_updates setting — so it goes when the subscription does. The other
+  # per-user entry tables are deliberately left alone: User#can_read_entry?
+  # grants access to those entries without a subscription.
+  def clear_updated_entries
+    UpdatedEntry.where(user_id: user_id, feed_id: feed_id).delete_all
+  end
+
+  def add_feed_to_action
+    Search::AddFeedToAction.perform_async(user_id)
+  end
+
+  def remove_feed_from_action
+    Search::RemoveFeedFromAction.perform_async(user_id, feed_id)
+  end
+
+  def expire_stat_cache
+    Rails.cache.delete("#{user_id}:entry_counts")
+  end
+
+  def untag
+    feed.tag("", user)
+  end
+
+  def prevent_generated_destroy
+    if generated?
+      throw(:abort)
+    else
+      true
+    end
+  end
+
+  def muted_status
+    "is:muted" if muted
+  end
+
+  def health_status
+    if fixable?
+      "is:fixable"
+    elsif dead?
+      "is:dead"
+    end
+  end
+
+  def fixable?
+    feed.fixable?
+  end
+
+  def dead?
+    feed.dead?
+  end
+
+  def protected?
+    generated?
+  end
+
+  def replaceable_path
+    Rails.application.routes.url_helpers.fix_feed_path(self)
+  end
+
+  def destroyable_path
+    Rails.application.routes.url_helpers.destroy_subscription_fix_feed_path(self)
+  end
+
+  private
+
+  def refresh_favicon
+    FaviconCrawler::Finder.perform_async(feed.host)
+    ImageCrawler::ItunesFeedImage.perform_async(feed_id)
+    ImageCrawler::FeedIcon.perform_async(feed_id)
+  end
+end

@@ -1,0 +1,45 @@
+require "test_helper"
+
+module Search
+  class SearchServerSetupTest < ActiveSupport::TestCase
+    setup do
+      flush_redis
+      clear_search
+      @user = users(:ben)
+      feed = @user.feeds.first
+      @entries = bulk_create_entries(feed, (1..10).to_a.sample)
+    end
+
+    test "should bulk index entries in elasticsearch" do
+      Sidekiq::Testing.inline! do
+        SearchServerSetup.new.build
+      end
+      Search.client { _1.refresh }
+
+
+      query = {
+        query: {
+          bool: {
+            filter: {
+              ids: {
+                values: @entries.map(&:id)
+              }
+            }
+          }
+        }
+      }
+      assert_equal @entries.count, Search.client { _1.search(Search.index_name(Entry.table_name), query: query) }.total
+    end
+
+    test "should touch actions" do
+      entry = @entries.first
+      action = @user.actions.create(feed_ids: [entry.feed.id], query: "\"#{entry.title}\"")
+      before = action.reload.updated_at
+      Sidekiq::Testing.inline! do
+        SearchServerSetup.new.build
+      end
+      Search.client { _1.refresh }
+      assert_not_equal(before, action.reload.updated_at)
+    end
+  end
+end

@@ -1,0 +1,69 @@
+class Source
+  attr_accessor :response, :feeds
+
+  def initialize(response)
+    @response = response
+    @feeds = []
+  end
+
+  def self.find(*args)
+    source = new(*args)
+    source.find
+    source.feeds
+  end
+
+  def self.options(*args)
+    source = new(*args)
+    source.options
+  end
+
+  # Collection-returning methods here return [], never nil: callers chain
+  # .uniq/.each straight onto the result, and FeedFinder runs the sources in
+  # order, so one of them returning nil takes every later strategy down with
+  # it — the site is reported as having no feed rather than falling through to
+  # the known patterns and the guesses.
+  def options
+    []
+  end
+
+  def document
+    @document ||= begin
+      parsed = response.parse(validate: false)
+      parsed.document if parsed.respond_to?(:document)
+    end
+  end
+
+  def document?
+    !document.nil?
+  end
+
+  def create_from_url!(url)
+    create_from_request!(Feedkit::Request.download(url, block_ssrf: true))
+  end
+
+  def create_from_request!(response)
+    feed = Feed.xml.where(feed_url: response.url).take
+    if feed.present? && (feed.last_download.nil? || feed.last_download.before?(1.day.ago))
+      response.persist!
+      FeedCrawler::Parser.new.parse_and_save(feed, response.path, encoding: response.encoding.to_s, import: true)
+    else
+      feed = Feed.create_from_parsed_feed(response.parse)
+    end
+    stamp_download(feed)
+    feed
+  rescue
+    raise unless Rails.env.production?
+  end
+
+  def stamp_download(feed)
+    return unless feed&.crawl_data&.error_count == 0
+    feed.crawl_data.log_download
+    feed.update_column(:crawl_data, feed.crawl_data)
+  end
+
+  def join_url(base, path)
+    base = Addressable::URI.parse(base)
+    path = Addressable::URI.parse(path)
+    Addressable::URI.join(base, path).to_s
+  end
+end

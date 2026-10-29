@@ -1,0 +1,65 @@
+class Share::Service
+
+  class AuthError < StandardError; end
+
+  def authenticated_share(klass, params)
+    response = {}
+    entry = Entry.find(params[:entry_id])
+    params["entry_url"] = entry.fully_qualified_url
+    if params["entry_url"].blank?
+      # fully_qualified_url is nil whenever the entry's url is blank or cannot
+      # be resolved. Sharing it posts a nil url, which the remote rejects, and
+      # the retry below would then re-post the same nil url 25 times.
+      response[:error] = "This article has no link to share."
+    elsif klass.active?
+      # child classes using this need to implement add
+      status = add(params)
+      if status == 200
+        response[:message] = "Sent to #{klass.label}."
+      elsif status == 401
+        klass.auth_error!
+        response[:url] = Rails.application.routes.url_helpers.sharing_services_path
+        response[:error] = "#{klass.label} authentication error."
+      elsif status == :unreachable
+        response[:error] = "Could not connect to #{klass.label}."
+      else
+        response[:error] = "There was a problem connecting to #{klass.label}."
+        ShareRetry.perform_in(1.minute, klass.id, params)
+      end
+    else
+      response[:url] = Rails.application.routes.url_helpers.sharing_services_path
+      response[:error] = "#{klass.label} authentication error."
+    end
+    response
+  rescue => exception
+    raise unless Rails.env.production?
+    ErrorService.notify(exception)
+    response[:error] = "Unknown share error."
+  end
+
+  def determine_content(params)
+    entry = Entry.find(params[:entry_id])
+    if params[:readability] == "on"
+      url = entry.fully_qualified_url
+      content_info = MercuryParser.parse(url)
+      content = content_info.content
+    else
+      content = entry.content
+    end
+    content
+  end
+
+  def self.determine_content(params)
+    new.determine_content(params)
+  end
+
+  def share_link
+    {
+      url: Rails.application.routes.url_helpers.share_supported_sharing_service_path(@klass, 9_999_999_999),
+      label: @klass.label,
+      html_options: @klass.html_options
+    }
+  rescue
+    nil
+  end
+end

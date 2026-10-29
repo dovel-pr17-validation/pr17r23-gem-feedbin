@@ -1,0 +1,251 @@
+module Searchable
+  extend ActiveSupport::Concern
+
+  included do
+    UNREAD_REGEX = /(?<=\s|^)(?:(?<boolean>AND|OR|NOT)\s+)?is:\s*unread(?=\s|$)/
+    READ_REGEX = /(?<=\s|^)is:\s*read(?=\s|$)/
+    STARRED_REGEX = /(?<=\s|^)(?:(?<boolean>AND|OR|NOT)\s+)?is:\s*starred(?=\s|$)/
+    UNSTARRED_REGEX = /(?<=\s|^)is:\s*unstarred(?=\s|$)/
+    SORT_REGEX = /(?<=\s|^)sort:\s*(asc|desc|relevance)(?=\s|$)/i
+    TAG_ID_REGEX = /tag_id:\s*(\d+)/
+    TAG_GROUP_REGEX = /tag_id:\((.*?)\)/
+    RANGE_REGEX = /published:\(.*?\)|published:\[.*?\]|updated:\(.*?\)|updated:\[.*?\]|media_duration:\(.*?\)|media_duration:\[.*?\]|word_count:\(.*?\)|word_count:\[.*?\]/
+    RANGE_UNBOUNDED_REGEX = /published:[<>=+].*?(?=\s|$)|updated:[<>=+].*?(?=\s|$)|media_duration:[<>=+].*?(?=\s|$)|word_count:[<>=+].*?(?=\s|$)/
+
+    # A limit on how many are counted, not a switch that turns counting off.
+    # The old guard meant the fiftieth saved search silently blanked the badge
+    # on all fifty, with a 200 and nothing to explain it.
+    MAX_COUNTED_SAVED_SEARCHES = 50
+
+    def self.saved_search_count(user)
+      saved_searches = user.saved_searches.first(MAX_COUNTED_SAVED_SEARCHES)
+      return if saved_searches.blank?
+
+      searches = build_count_searches(user, saved_searches)
+      return if searches.blank?
+
+      unread_ids = user.unread_entries.pluck(:entry_id)
+
+      aggregations = searches.each_with_index.each_with_object({}) do |(search, index), aggs|
+        aggs[index.to_s] = {
+          filter: search.query[:query],
+          aggs: {
+            matches: {top_hits: {size: 50, _source: false, sort: [{published: "desc"}]}}
+          }
+        }
+      end
+
+      body = {
+        size: 0,
+        track_total_hits: false,
+        query: {bool: {filter: [{ids: {values: unread_ids}}]}},
+        aggs: aggregations
+      }
+
+      data = Search.client { _1.aggregations(Search.index_name(Entry.table_name), query: body) }
+
+      searches.each_with_index.each_with_object({}) do |(search, index), counts|
+        hits = data.safe_dig("aggregations", index.to_s, "matches", "hits", "hits") || []
+        counts[search.id] = hits.map { _1["_id"].to_i }
+      end
+    end
+
+    def self.build_count_searches(user, saved_searches)
+      # Read once for the whole batch rather than once per saved search.
+      starred_ids = user.starred_entries.pluck(:entry_id)
+      allowed_feed_ids = user.subscriptions.pluck(:feed_id)
+
+      saved_searches.filter_map { |saved_search|
+        query_string = saved_search.query
+
+        next if READ_REGEX.match?(query_string)
+
+        query_string = query_string.gsub(UNREAD_REGEX, "")
+        query = build_query(
+          user: user,
+          query: query_string,
+          starred_ids: starred_ids,
+          allowed_feed_ids: allowed_feed_ids
+        )
+        OpenStruct.new({id: saved_search.id, query: query.slice(:query)})
+      }
+    end
+
+    def self.scoped_search(params, user)
+      data     = params.clone
+      per_page = data.delete(:per_page).presence&.to_i || WillPaginate.per_page
+      page     = data.delete(:page).presence&.to_i || 1
+      query    = build_query(user: user, query: data[:query], feed_ids: data[:feed_ids])
+
+      result = Search.client { _1.validate(Search.index_name(Entry.table_name), query: {query: query[:query]}) }
+      if result == false
+        Search::Response.new({})
+      else
+        Search.client { _1.search(Search.index_name(Entry.table_name), query: query, page: page, per_page: per_page) }
+      end
+    end
+
+    def self.escape_search(query)
+      if query.present? && query.respond_to?(:gsub)
+        extracted_fields = []
+
+        query = query.gsub(RANGE_REGEX) { |match|
+          extracted_fields.push(match)
+          ""
+        }
+
+        query = query.gsub(RANGE_UNBOUNDED_REGEX) { |match|
+          extracted_fields.push(match)
+          ""
+        }
+
+        special_characters_regex = /([\+\-\!\{\}\[\]\^\~\?\\\/])/
+        escape = '\ '.sub(" ", "")
+        query = query.gsub(special_characters_regex) { |character| escape + character }
+
+        query = query.gsub("title_exact:",   "title.exact:")
+        query = query.gsub("content_exact:", "content.exact:")
+        query = query.gsub("body:",          "content:")
+        query = query.gsub("emoji:",         "")
+        query = query.gsub("_missing_:",     "NOT _exists_:")
+
+        colon_regex = /(?<!title|title.exact|feed_id|content|content.exact|author|_missing_|_exists_|twitter_screen_name|twitter_name|twitter_retweet|twitter_media|twitter_image|twitter_link|emoji|url|url.exact|link|type|category):(?=.*)/
+        query = query.gsub(colon_regex, '\:')
+
+        extracted_fields.push(query).join(" ")
+      end
+    end
+
+    def self.replace_tag_ids(query, user)
+      tag_replacer = proc do |ids|
+        ids = [*ids]
+        feed_ids = user.taggings.where(tag_id: ids).pluck("DISTINCT feed_id")
+        string = feed_ids.join(" OR ")
+        if feed_ids.length == 1
+          "feed_id:#{string}"
+        else
+          "feed_id:(#{string})"
+        end
+      end
+
+      query = query.gsub(TAG_ID_REGEX) {
+        tag_id = Regexp.last_match[1]
+        tag_replacer.call(tag_id)
+      }
+
+      query = query.gsub(TAG_GROUP_REGEX) {
+        tag_group = Regexp.last_match[1]
+        tag_ids = tag_group.split(" OR ")
+        tag_replacer.call(tag_ids)
+      }
+
+      query
+    end
+
+    # starred_ids, unread_ids and allowed_feed_ids are the user's whole lists,
+    # unbounded and identical across a batch. saved_search_count builds one
+    # query per saved search, so without these they were re-plucked once per
+    # search on a request the sidebar polls.
+    def self.build_query(user:, query:, feed_ids: nil, size: nil, starred_ids: nil, unread_ids: nil, allowed_feed_ids: nil)
+      query ||= ""
+      query = replace_tag_ids(query, user)
+      query = query.gsub(READ_REGEX,      "NOT is:unread")
+      query = query.gsub(UNSTARRED_REGEX, "NOT is:starred")
+      min_should =
+
+      starred_ids ||= user.starred_entries.pluck(:entry_id)
+      allowed_feed_ids ||= user.subscriptions.pluck(:feed_id)
+      if feed_ids.present?
+        allowed_feed_ids = (feed_ids & allowed_feed_ids)
+      end
+
+      sort = if matches = SORT_REGEX.match(query)
+        query = query.gsub(SORT_REGEX, "")
+        matches[1].downcase
+      else
+        "desc"
+      end
+
+      {}.tap do |request|
+        request[:query] = {
+          bool: {
+            filter: {
+              bool: {
+                should: [
+                  {terms: {feed_id: allowed_feed_ids}},
+                  {ids: {values: starred_ids}}
+                ]
+              }
+            },
+            should: [],
+            must: [],
+            must_not: []
+          }
+        }
+
+        request[:fields] = ["id"]
+
+        # Elasticsearch otherwise stops counting at 10,000 and reports the cap
+        # as the total, which the UI renders as a fact -- "Mark 10,000 articles
+        # as read?" for a search matching forty thousand.
+        request[:track_total_hits] = true
+
+        if size
+          request[:from] = 0
+          request[:size] = size
+        end
+
+        unless sort == "relevance"
+          request[:sort] = [{
+            published: sort
+          }]
+        end
+
+        states = [
+          [STARRED_REGEX, -> { starred_ids }],
+          [UNREAD_REGEX, -> { unread_ids ||= user.unread_entries.pluck(:entry_id) }]
+        ]
+
+        # handles the case of `is:starred OR is:unread`
+        or_found = states.any? do |regex, id_source|
+          match = regex.match(query)
+          match[:boolean] == "OR" if match
+        end
+
+        states.each do |regex, id_source|
+          if matches = regex.match(query)
+            query = query.gsub(regex, "")
+            boolean = { ids: { values: id_source.call } }
+
+            case matches[:boolean]
+            when "OR"
+              request[:query][:bool][:should].push(boolean)
+            when "NOT"
+              request[:query][:bool][:must_not].push(boolean)
+            else # AND + nil
+              target = or_found ? :should : :must
+              request[:query][:bool][target].push(boolean)
+            end
+          end
+        end
+
+        query = escape_search(query)
+        if query.present?
+          request[:query][:bool][:should].push({
+            query_string: {
+              fields: ["title", "title.*", "content", "content.*", "author", "url", "link"],
+              quote_field_suffix: ".exact",
+              default_operator: "AND",
+              allow_leading_wildcard: false,
+              query: query
+            }
+          })
+        end
+
+        if request[:query][:bool][:should].present?
+          request[:query][:bool][:minimum_should_match] = 1
+        end
+      end
+    end
+  end
+end

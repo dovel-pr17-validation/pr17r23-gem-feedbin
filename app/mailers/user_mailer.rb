@@ -1,0 +1,70 @@
+class UserMailer < ApplicationMailer
+  default from: "Feedbin <#{ENV["FROM_ADDRESS"]}>", skip_premailer: true
+  include ApplicationHelper
+  helper ApplicationHelper
+
+  def payment_receipt(billing_event)
+    @billing_event = BillingEvent.find(billing_event)
+    @user = @billing_event.billable
+    mail to: @user.email, subject: "[Feedbin] Payment Receipt"
+  end
+
+  def payment_failed(billing_event)
+    @billing_event = BillingEvent.find(billing_event)
+    @user = @billing_event.billable
+    mail to: @user.email, subject: "[Feedbin] Please Update Your Billing Information"
+  end
+
+  def payment_action_required(billing_event)
+    @billing_event = BillingEvent.find(billing_event)
+    @user = @billing_event.billable
+    mail to: @user.email, subject: "[Feedbin] Confirm Your Payment"
+  end
+
+  def subscription_reminder(billing_event)
+    @billing_event = BillingEvent.find(billing_event)
+    @user = @billing_event.billable
+    mail to: @user.email, subject: "[Feedbin] Your Subscription Will Renew Soon"
+  end
+
+  def password_reset(user_id, reset_token)
+    @user = User.find(user_id)
+    @reset_token = reset_token
+    mail to: @user.email, subject: "[Feedbin] Password Reset"
+  end
+
+  def trial_expiration(user_id)
+    @user = User.find(user_id)
+    mail to: @user.email, subject: "[Feedbin] Your Trial is About to End"
+  end
+
+  def timed_plan_expiration(user_id)
+    @user = User.find(user_id)
+    mail to: @user.email, subject: "[Feedbin] Your Account has Expired"
+  end
+
+  def starred_export_download(user_id, download_link)
+    @user = User.find(user_id)
+    @download_link = download_link
+    mail to: @user.email, subject: "[Feedbin] Starred Items Export Complete"
+  end
+
+  def kindle(kindle_address, title, epub)
+    filename = title || "epub"
+    attachments["#{filename}.epub"] = File.read(epub)
+    mail to: kindle_address, subject: "Kindle Content", body: ".", from: ENV["KINDLE_EMAIL"]
+  end
+
+  # Takes the address rather than a user id: it is sent after the account has
+  # been deleted, so there is no record left to look up.
+  def account_closed(email, opml)
+    @email = email
+    attachments["subscriptions.xml"] = opml
+    mail to: @email, subject: "[Feedbin] Account Closed"
+  end
+
+  def onboarding_health_alert(unhealthy_feeds)
+    @unhealthy_feeds = unhealthy_feeds
+    mail to: ENV["ADMIN_EMAIL"], subject: "[Feedbin] Onboarding Feed Health Alert"
+  end
+end

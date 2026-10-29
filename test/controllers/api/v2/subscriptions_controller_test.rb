@@ -1,0 +1,94 @@
+require "test_helper"
+
+class Api::V2::SubscriptionsControllerTest < ApiControllerTestCase
+  setup do
+    @user = users(:ben)
+  end
+
+  test "should get index" do
+    login_as @user
+    get :index, format: :json
+    assert_response :success
+
+    get :index, format: :xml
+    assert_response :success
+  end
+
+  test "should accept a minute-precision since" do
+    login_as @user
+    since = 10.years.ago.utc.strftime("%Y-%m-%dT%H:%MZ")
+
+    get :index, params: {since: since}, format: :json
+
+    assert_response :success
+    assert_equal @user.subscriptions.count, parse_json.count
+  end
+
+  test "should say which parameter is wrong when since cannot be parsed" do
+    login_as @user
+
+    get :index, params: {since: "yesterday"}, format: :json
+
+    assert_response :bad_request
+    assert parse_json["errors"].any? { |error| error.key?("since") }, parse_json.inspect
+  end
+
+  test "should show subscription" do
+    login_as @user
+    subscription = @user.subscriptions.first
+    get :show, params: {id: subscription}, format: :json
+    assert_response :success
+    assert_equal subscription.id, parse_json["id"]
+    assert_equal subscription.feed_id, parse_json["feed_id"]
+  end
+
+  test "should not show another user's subscription" do
+    login_as @user
+    other = users(:new).subscriptions.create!(feed: feeds(:kottke))
+    get :show, params: {id: other}, format: :json
+    assert_response :forbidden
+  end
+
+  test "should create subscription" do
+    api_content_type
+
+    html_url = "www.example.com/index.html"
+    stub_request_file("index.html", html_url)
+    stub_request_file("atom.xml", "www.example.com/atom.xml")
+
+    login_as @user
+    assert_difference "Subscription.count", +1 do
+      post :create, params: {feed_url: html_url}, format: :json
+      assert_response :success
+    end
+  end
+
+  test "should update subscription" do
+    login_as @user
+    subscription = @user.subscriptions.first
+
+    attributes = {title: "#{@user.subscriptions.first} new"}
+    patch :update, params: {id: subscription, subscription: attributes}, format: :json
+
+    assert_response :success
+    attributes.each do |attribute, value|
+      assert_equal(value, subscription.reload.send(attribute))
+    end
+  end
+
+  test "should return 400 on malformed JSON body" do
+    api_content_type
+    login_as @user
+
+    notifications = []
+    ErrorService.stub :notify, ->(exception) { notifications << exception } do
+      post :create, body: "{not valid json", format: :json
+    end
+
+    assert_response :bad_request
+    body = JSON.parse(response.body)
+    assert_equal 400, body["status"]
+    assert_equal "Problem parsing JSON", body["message"]
+    assert_equal 1, notifications.size
+  end
+end

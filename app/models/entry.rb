@@ -1,0 +1,541 @@
+class Entry < ApplicationRecord
+  include Searchable
+
+  attr_accessor :fully_qualified_url, :read, :starred, :skip_mark_as_unread, :skip_recent_post_check
+
+  store :settings, accessors: [:archived_images, :newsletter_from, :embed_duration, :newsletter_to, :newsletter_token], coder: EntrySettingsCoder
+
+  enum :provider, [:twitter, :youtube, :favicon, :entry_icon], prefix: true
+
+  belongs_to :feed
+  has_many :unread_entries, dependent: :delete_all
+  has_many :starred_entries
+  has_many :recently_read_entries
+
+  # Every row keyed by this entry's id -- the preview image, the
+  # tweet/micropost link preview, and the entry_icon row -- in one query;
+  # preview_image_record, link_image_record and icon_image_record read from
+  # it.
+  has_many :owned_image_records, -> { entry_owned }, class_name: "Image", foreign_key: :provider_id
+  # The avatar of this video's own channel -- a playlist feed mixes videos
+  # from many channels, keyed by provider_parent_id (UC-form).
+  has_one :channel_image_record, -> { provider_embed_icon }, class_name: "Image", foreign_key: :provider_id, primary_key: :provider_parent_id
+
+  before_create :ensure_published
+  before_create :create_summary
+  before_create :update_content
+  before_create :provider_metadata
+
+  before_update :create_summary
+  before_save :recompress_original_content
+
+  after_commit :cache_public_id, on: [:create, :update]
+  after_commit :find_images, on: :create
+  after_commit :mark_as_unread, on: :create
+  after_commit :mark_as_unplayed, on: :create
+  after_commit :increment_feed_stat, on: :create
+  after_commit :touch_feed_last_published_entry, on: :create
+  after_commit :harvest_links, on: :create
+  after_commit :harvest_embeds, on: [:create, :update]
+  after_commit :cache_views, on: [:create, :update]
+  after_commit :search_index_store_update, on: [:update]
+
+  validate :has_content
+  validates :feed, :public_id, presence: true
+
+  self.per_page = 100
+
+  scope :last_n_per_feed, -> (n, feed_ids) {
+     select_sql = <<-SQL
+       entries.*, ROW_NUMBER() OVER (
+         PARTITION BY feed_id
+         ORDER BY published DESC
+       ) AS entries_rank
+     SQL
+
+     ranked_posts = select(select_sql)
+     from(ranked_posts, "entries")
+       .where("entries_rank <= ?", n)
+       .where(feed_id: feed_ids)
+   }
+
+  # Everything entries/_entry touches beyond the entry itself. Attaching
+  # less makes a cache-miss render cost a query per row.
+  scope :with_list_associations, -> {
+    includes(feed: Feed::ICON_PRELOADS).preload(:owned_image_records, :channel_image_record)
+  }
+
+  # The same associations plus a narrow column select; separate because
+  # search-result and materialized relations cannot take the select.
+  def self.entries_list
+    select(:id, :feed_id, :title, :summary, :published, :data, :author, :url, :updated_at, :settings, :provider_parent_id)
+      .with_list_associations
+  end
+
+  # What api/v2/entries/_entry.json renders; extended mode also reads the
+  # preview image row, at up to 100 entries a request.
+  scope :for_api, ->(mode = nil) {
+    mode.to_s == "extended" ? includes(:feed).preload(:owned_image_records) : includes(:feed)
+  }
+
+  def newsletter?
+    feed.newsletter?
+  end
+
+  def youtube?
+    data && data["youtube_video_id"].present?
+  end
+
+  def podcast?
+    data && ["audio/mp3", "audio/mpeg"].include?(data["enclosure_type"])
+  end
+
+  def tweet?
+    tweet.present?
+  end
+
+  def micropost?
+    micropost.present?
+  end
+
+  def author
+    return self[:author] unless self[:author].nil?
+    return if json_feed.nil?
+
+    authors = json_feed.safe_dig("authors")
+    return authors unless authors.respond_to?(:filter_map)
+    authors = authors.filter_map { it&.safe_dig("name") }
+    authors.to_sentence
+  rescue
+    nil
+  end
+
+  def fully_qualified_url
+    return nil if url.blank? || !url.respond_to?(:strip)
+    return url.strip if url.strip.downcase.start_with?("http")
+    return url if feed.pages?
+
+    result = feed.site_relative_url(url)
+    if result.blank?
+      result = feed.feed_relative_url(url)
+    end
+    result
+  end
+
+  # strict: is the asset reading, as in Feed#rebase_url: a url without a
+  # scheme is a path, never a host.
+  def rebase_url(original_url, strict: false)
+    return nil if original_url.nil?
+    return original_url.strip if original_url.strip.downcase.start_with?("http")
+    return nil if fully_qualified_url.nil?
+
+    base = Addressable::URI.heuristic_parse(fully_qualified_url)
+    original_url = strict ? Addressable::URI.parse(original_url.strip) : Addressable::URI.heuristic_parse(original_url)
+    Addressable::URI.join(base, original_url).to_s
+  rescue Addressable::URI::InvalidURIError
+    Rails.logger.error("Invalid uri original_url=#{original_url} fully_qualified_url=#{fully_qualified_url}")
+    nil
+  end
+
+  def base_url
+    feed.pages? ? url : feed.site_url
+  end
+
+  # The images row is the only source. The legacy JSON on the entry is
+  # inert data: nothing writes it since the S3 backfill and nothing reads
+  # it. An entry without a row renders no image.
+  def processed_image
+    if record = preview_image_record
+      Image.public_url_for(record.storage_path)
+    end
+  end
+
+  def preview_image_data
+    if record = preview_image_record
+      {
+        "original_url" => record.final_url || record.url,
+        "width" => record.width,
+        "height" => record.height
+      }
+    end
+  end
+
+  def placeholder_color
+    color = preview_image_record&.placeholder_color
+    if color.respond_to?(:length) && color.length == 6
+      color
+    end
+  end
+
+  def preview_image_record
+    owned_image_records.detect(&:provider_entry_preview?)
+  end
+
+  def link_image_record
+    owned_image_records.detect(&:provider_entry_link_preview?)
+  end
+
+  # The micropost author's avatar or a podcast episode's art.
+  def icon_image_record
+    owned_image_records.detect(&:provider_entry_icon?)
+  end
+
+  def processed_image?
+    processed_image ? true : false
+  end
+
+  # The episode's own art. The entry_icon row is shared with the micropost
+  # avatar, so the kind decides which reader sees it.
+  def itunes_image
+    record = icon_image_record
+    return nil unless record&.kind_cover_art?
+    Image.public_url_for(record.storage_path)
+  end
+
+  # The micropost author's avatar row, written by
+  # ImageCrawler::MicropostAvatar, or nil.
+  def author_avatar_record
+    record = icon_image_record
+    record if record&.kind_avatar?
+  end
+
+  def original_content
+    OriginalContent.decompress(compressed_original_content, base: content)
+  end
+
+  def content_diff
+    @content_diff ||= begin
+      result = nil
+      original = original_content
+      if content && original.present? && original.length != content.length
+        begin
+          before = ContentFormatter.format!(original, self)
+          after = ContentFormatter.format!(content, self)
+          result = HTMLDiff::Diff.new("<div>#{before}</div>", "<div>#{after}</div>").inline_html
+          result = result.html_safe
+        rescue
+        end
+      end
+      result
+    end
+  end
+
+  # nil, not 0, when the feed gave no itunes:duration -- 0 renders as
+  # "0 minutes" and makes callers' nil guards dead code.
+  def audio_duration
+    seconds = 0
+    duration = data && data["itunes_duration"]
+
+    return nil if duration.nil?
+
+    parts = duration.to_s.split(":").map(&:to_i).compact
+    parts.first(3).reverse.each_with_index do |item, index|
+      seconds += item * 60 ** index
+    end
+    seconds
+  end
+
+  def media_duration
+    duration = embed_duration || audio_duration
+    return nil if duration == 0
+    duration
+  end
+
+  def media
+    items = data&.safe_dig("media").respond_to?(:each) && data&.safe_dig("media") || []
+    items.filter_map do |item|
+      next unless item.respond_to?(:dig)
+      url = item.safe_dig("url")
+      type = item.safe_dig("type")
+      next unless url.present? && type.present?
+      next unless url.start_with?("http")
+      OpenStruct.new(url: url, type: type)
+    end
+  end
+
+  def micropost
+    @micropost ||= begin
+      if data.respond_to?(:has_key?)
+        post = Micropost.new(self.data, title, feed: feed, link_image: link_image_record)
+        post.valid? ? post : nil
+      end
+    end
+  end
+
+  def archived_images?
+    !!archived_images
+  end
+
+  def newsletter_url
+    NewsletterPage.new(self).url
+  end
+
+  def extracted_content_url
+    MercuryParser.new(fully_qualified_url).service_url rescue nil
+  end
+
+  def hostname
+    Addressable::URI.heuristic_parse(url).host
+  rescue
+    nil
+  end
+
+  def content_format
+    data && data["format"] || "default"
+  end
+
+  def search_data
+    SearchData.new(self).to_h
+  end
+
+  def public_id_alt
+    data && data["public_id_alt"]
+  end
+
+  def published_recently?
+    published > 7.days.ago
+  end
+
+  def thread
+    data&.safe_dig("thread") || []
+  end
+
+  def twitter_thread_ids
+    thread.map do |t|
+      t.safe_dig("id")
+    end
+  end
+
+  def tweet_thread
+    @tweet_thread ||= begin
+      thread.map { |part| Twitter::Tweet.new(part.deep_symbolize_keys) }
+    end
+  rescue
+    []
+  end
+
+  def twitter_id
+    data&.safe_dig("tweet", "id")
+  end
+
+  def tweet
+    @tweet ||=
+      if data.is_a?(Hash) && data["tweet"].is_a?(Hash)
+        Tweet.new(data, preview_image_record, link_image_record) rescue nil
+      end
+  end
+
+  def json_feed
+    data&.respond_to?(:dig) && data&.safe_dig("json_feed")
+  end
+
+  def urls
+    array = data&.safe_dig("urls")&.map do |url|
+      Addressable::URI.heuristic_parse(url)
+    end
+    array || []
+  end
+
+  def link_image
+    if record = link_image_record
+      Image.public_url_for(record.storage_path)
+    end
+  end
+
+  def link_image_placeholder_color
+    color = link_image_record&.placeholder_color
+    if color.respond_to?(:length) && color.length == 6
+      color
+    end
+  end
+
+  def link_preview_url
+    if tweet?
+      tweet.main_tweet.urls.first.expanded_url.to_s
+    elsif micropost?
+      urls.first.to_s
+    end
+  end
+
+  def chapter_titles
+    return [] unless chapters.respond_to?(:map)
+    chapters.filter_map {it.safe_dig("tags", "title")}.filter(&:present?).map(&:clean)
+  end
+
+  def plain_title_with_default
+    title&.to_plain_text || "Untitled"
+  end
+
+  private
+
+  # A stored value only decompresses against the content it was made from, so
+  # every content change must re-encode it. Skip when this save also sets the
+  # column: the caller already made it against the new content.
+  def recompress_original_content
+    return unless will_save_change_to_content? && compressed_original_content?
+    return if will_save_change_to_compressed_original_content?
+    original = OriginalContent.decompress(compressed_original_content, base: content_in_database)
+    self.compressed_original_content = OriginalContent.compress(original, base: content)
+  end
+
+  def provider_metadata
+    if tweet? && tweet.main_tweet
+      self.url = tweet.main_tweet.uri.to_s
+      self.provider = self.class.providers[:twitter]
+      self.provider_id = tweet.main_tweet.id
+    elsif youtube?
+      self.provider = self.class.providers[:youtube]
+      self.provider_id = data["youtube_video_id"]
+      # The entry's own <yt:channelId> outranks the embed lookup: known at
+      # creation, and still there when the API round trip returns nothing
+      # (rate-limited key, private video).
+      self.provider_parent_id = data["youtube_channel_id"].presence ||
+        Embed.youtube_video.find_by_provider_id(self.provider_id)&.parent_id
+    elsif feed.pages?
+      self.provider = self.class.providers[:favicon]
+      self.provider_id = hostname
+      self.provider_parent_id = self.provider_id
+    end
+  end
+
+  def update_content
+    original = content
+    if tweet?
+      self.content = ApplicationController.render(template: "entries/_tweet_default", formats: :html, locals: {entry: self}, layout: nil)
+    end
+  rescue
+    self.content = original
+  end
+
+  def has_content
+    if [title, url, entry_id, content].compact.count == 0
+      errors.add(:base, "entry has no content")
+    end
+  end
+
+  def ensure_published
+    now = Time.now
+    if published.nil? || published > now || published.to_i <= 0
+      self.published = now
+    end
+    true
+  end
+
+  def cache_public_id
+    FeedbinUtils.update_public_id_cache(public_id, content, public_id_alt)
+  end
+
+  def mark_as_unread
+    if skip_mark_as_unread.blank? && recent_post
+      filters = {}.tap do |hash|
+        hash[:feed_id] = feed_id
+        hash[:active] = true
+        hash[:muted] = false
+      end
+
+      user_ids = Subscription.where(filters).pluck(:user_id)
+      unread_entries = user_ids.each_with_object([]) { |user_id, array|
+        array << UnreadEntry.new(user_id: user_id, feed_id: feed_id, entry_id: id, published: published, entry_created_at: created_at)
+      }
+      UnreadEntry.import(unread_entries, validate: false, on_duplicate_key_ignore: true)
+    end
+    Search::SearchIndexStore.perform_async(self.class.name, id)
+  end
+
+  def search_index_store_update
+    Search::SearchIndexStore.perform_async(self.class.name, id, true)
+  end
+
+  def mark_as_unplayed
+    return if skip_mark_as_unread.present? || !recent_post
+
+    subscriptions = PodcastSubscription.where(feed_id: feed_id, status: [:subscribed, :bookmarked])
+
+    queued_entries = []
+    notification_ids = []
+
+    subscriptions.each do |subscription|
+      if subscription.subscribed? && !subscription.filtered?(podcast_search_data)
+        queued_entries.push QueuedEntry.new(user_id: subscription.user_id, feed_id: feed_id, entry_id: id, order: Time.now.to_i, progress: 0, duration: audio_duration.to_i)
+        notification_ids.push subscription.user_id
+      elsif subscription.bookmarked?
+        notification_ids.push subscription.user_id
+      end
+    end
+
+    if queued_entries.present?
+      # Count what was inserted, not what was offered: import skips callbacks,
+      # so the counter is maintained here, and on_duplicate_key_ignore drops
+      # any subscriber already holding this episode.
+      result = QueuedEntry.import(queued_entries, validate: false, on_duplicate_key_ignore: true)
+      increment!(:queued_entries_count, result.ids.count) if result.ids.any?
+    end
+
+    Sidekiq::Client.push_bulk("args" => notification_ids.map {|user_id| [user_id, id]}, "class" => PodcastPushNotification)
+
+    if data.safe_dig("enclosure_url").present? && data.safe_dig("enclosure_type") =~ /audio/i
+      ChapterParser.perform_async(id)
+    end
+  end
+
+  def podcast_search_data
+    [title, data&.safe_dig("itunes_author"), content].join
+  end
+
+  def recent_post
+    skip_recent_post_check || published > 1.month.ago
+  end
+
+  def increment_feed_stat
+    result = FeedStat.where(feed_id: feed_id, day: published).update_all("entries_count = entries_count + 1")
+    if result == 0
+      FeedStat.create(feed_id: feed_id, day: published, entries_count: 1)
+    end
+  end
+
+  def create_summary
+    if tweet?
+      begin
+        self.summary = tweet.tweet_summary
+      rescue
+        self.summary = ""
+      end
+    else
+      self.summary = ContentFormatter.summary(content, 256)
+    end
+  end
+
+  def touch_feed_last_published_entry
+    last_published_entry = feed.last_published_entry
+    if last_published_entry.nil? || last_published_entry < published
+      feed.last_published_entry = published
+      feed.save
+    end
+  end
+
+  def find_images
+    ImageCrawler::EntryImage.perform_async(public_id)
+    if data && data["itunes_image"]
+      ImageCrawler::ItunesImage.perform_async(public_id)
+    end
+  end
+
+  def has_embeds?
+    return true if youtube?
+    return true if micropost?
+    return true if content.respond_to?(:include?) && content.include?("iframe")
+    return false
+  end
+
+  def harvest_embeds
+    HarvestEmbeds.perform_async(id) if has_embeds?
+  end
+
+  def harvest_links
+    HarvestLinks.perform_async(id) if micropost?
+  end
+
+  def cache_views
+    CacheEntryViews.new.perform(id)
+  end
+end

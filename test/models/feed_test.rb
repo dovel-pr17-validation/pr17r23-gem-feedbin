@@ -1,0 +1,338 @@
+require "test_helper"
+
+class FeedTest < ActiveSupport::TestCase
+  test "check refuses private network addresses" do
+    options = nil
+    Feedkit::Request.stub(:download, ->(_url, **args) { options = args }) do
+      feeds(:daring_fireball).check
+    end
+
+    assert_equal true, options[:block_ssrf]
+  end
+
+  # A url in the feed's options is never rendered: only a row is. A feed
+  # without one renders its host's favicon.
+  test "icon_url is the stored row, never the options url through the proxy" do
+    with_env("UNIFIED_IMAGE_HOST" => "images.example.com") do
+      feed = create_feeds(users(:ben)).first
+      feed.update!(options: {"json_feed" => {"icon" => "https://old.example.com/icon.png"}})
+
+      assert_nil feed.icon_url
+
+      path = Image.content_storage_path_for(SecureRandom.hex(16), "200x200", "jpg")
+      Image.create!(
+        provider: :feed_icon, provider_id: feed.id.to_s, feed_id: feed.id,
+        url: "http://example.com/show.jpg", variant: "200x200",
+        image_fingerprint: SecureRandom.hex(16),
+        original_fingerprint: SecureRandom.hex(16),
+        storage_path: path,
+        width: 200, height: 200, bytesize: 4_000, placeholder_color: "aabbcc"
+      )
+
+      assert_equal "https://images.example.com/#{path}", Feed.find(feed.id).icon_url
+    end
+  end
+
+  test "icon_url is nil when the feed has no icon at all" do
+    assert_nil create_feeds(users(:ben)).first.icon_url
+  end
+
+  # The channel feed serves the feed-level yt:channelId bare; everything
+  # else speaks UC-form, so the prefix is restored, keyed on length.
+  test "channel_id restores the UC prefix the channel feed strips" do
+    feed = Feed.create!(feed_url: "http://example.com/videos.xml", options: {"youtube_channel_id" => "BJycsmduvYEL83R_U4JriQ"})
+    assert_equal "UCBJycsmduvYEL83R_U4JriQ", feed.channel_id
+  end
+
+  test "channel_id comes from the parsed feed" do
+    feed = Feed.create!(feed_url: "http://example.com/videos.xml", options: {"youtube_channel_id" => "UC-lHJZR3Gqxm24_Vd_AJ5Yw"})
+    assert_equal "UC-lHJZR3Gqxm24_Vd_AJ5Yw", feed.channel_id
+  end
+
+  test "channel_id falls back to the feed url, and the parsed value wins" do
+    feed = Feed.create!(feed_url: "https://www.youtube.com/feeds/videos.xml?channel_id=UCfromurl")
+    assert_equal "UCfromurl", feed.channel_id
+
+    feed.update!(options: {"youtube_channel_id" => "UCparsed"})
+    assert_equal "UCparsed", feed.reload.channel_id
+  end
+
+  test "channel_id is nil for feeds that are not youtube" do
+    assert_nil create_feeds(users(:ben)).first.channel_id
+  end
+
+  # youtube_channel_id drives self_url and the WebSub hub, so it requires
+  # feed_url and self_url to agree; icon resolution needs no such guard.
+  test "channel_id does not require self_url the way youtube_channel_id does" do
+    feed = Feed.create!(feed_url: "https://www.youtube.com/feeds/videos.xml?channel_id=UCabc")
+
+    assert_nil feed.youtube_channel_id
+    assert_equal "UCabc", feed.channel_id
+  end
+
+  # The real WebSub guard is feed_url and self_url agreeing, not the
+  # spelling of the host -- www-less canonical feeds qualify.
+  test "youtube_channel_id accepts a www-less canonical feed" do
+    feed = Feed.create!(feed_url: "https://youtube.com/feeds/videos.xml?channel_id=UCwwwless")
+    feed.update_column(:self_url, "https://www.youtube.com/feeds/videos.xml?channel_id=UCwwwless")
+
+    assert_equal "UCwwwless", feed.reload.youtube_channel_id
+  end
+
+  # An empty channel_id= must be nil, not "" -- a truthy "" builds a
+  # degenerate self_url.
+  test "youtube_channel_id is nil for an empty channel_id parameter" do
+    feed = Feed.create!(feed_url: "https://www.youtube.com/feeds/videos.xml?channel_id=")
+    feed.update_column(:self_url, "https://www.youtube.com/feeds/videos.xml?channel_id=")
+
+    assert_nil feed.reload.youtube_channel_id
+  end
+
+  test "icon_url falls back to the channel row" do
+    with_env("UNIFIED_IMAGE_HOST" => "images.example.com") do
+      feed = Feed.create!(feed_url: "https://www.youtube.com/feeds/videos.xml?channel_id=UCabc")
+
+      assert_nil feed.icon_url
+
+      path = Image.content_storage_path_for(SecureRandom.hex(16), "200x200", "png")
+      Image.create!(
+        provider: :embed_icon, provider_id: "UCabc",
+        url: "https://yt3.ggpht.com/large.jpg", variant: "200x200",
+        image_fingerprint: SecureRandom.hex(16),
+        original_fingerprint: SecureRandom.hex(16),
+        storage_path: path,
+        width: 200, height: 200, bytesize: 4_000, placeholder_color: "aabbcc"
+      )
+
+      assert_equal "https://images.example.com/#{path}", Feed.find(feed.id).icon_url
+    end
+  end
+
+  # One row serves every feed for the channel -- that is the whole point of
+  # keying on the channel rather than on the feed.
+  test "every feed for a channel resolves the same avatar row" do
+    with_env("UNIFIED_IMAGE_HOST" => "images.example.com") do
+      one = Feed.create!(feed_url: "https://www.youtube.com/feeds/videos.xml?channel_id=UCabc")
+      two = Feed.create!(feed_url: "https://youtube.com/feeds/videos.xml?channel_id=UCabc")
+
+      path = Image.content_storage_path_for(SecureRandom.hex(16), "200x200", "png")
+      Image.create!(
+        provider: :embed_icon, provider_id: "UCabc",
+        url: "https://yt3.ggpht.com/large.jpg", variant: "200x200",
+        image_fingerprint: SecureRandom.hex(16),
+        original_fingerprint: SecureRandom.hex(16),
+        storage_path: path,
+        width: 200, height: 200, bytesize: 4_000, placeholder_color: "aabbcc"
+      )
+
+      assert_equal "https://images.example.com/#{path}", Feed.find(one.id).icon_url
+      assert_equal "https://images.example.com/#{path}", Feed.find(two.id).icon_url
+    end
+  end
+
+  # A tie that should never happen -- no feed is both a podcast and a YouTube
+  # channel -- written down so it is not decided by accident later.
+  test "the feed's own icon row outranks the shared channel row" do
+    with_env("UNIFIED_IMAGE_HOST" => "images.example.com") do
+      feed = Feed.create!(feed_url: "https://www.youtube.com/feeds/videos.xml?channel_id=UCabc")
+
+      own = Image.content_storage_path_for(SecureRandom.hex(16), "200x200", "jpg")
+      Image.create!(
+        provider: :feed_icon, provider_id: feed.id.to_s, feed_id: feed.id,
+        url: "http://example.com/show.jpg", variant: "200x200",
+        image_fingerprint: SecureRandom.hex(16),
+        original_fingerprint: SecureRandom.hex(16),
+        storage_path: own,
+        width: 200, height: 200, bytesize: 4_000, placeholder_color: "aabbcc"
+      )
+      Image.create!(
+        provider: :embed_icon, provider_id: "UCabc",
+        url: "https://yt3.ggpht.com/large.jpg", variant: "200x200",
+        image_fingerprint: SecureRandom.hex(16),
+        original_fingerprint: SecureRandom.hex(16),
+        storage_path: Image.content_storage_path_for(SecureRandom.hex(16), "200x200", "png"),
+        width: 200, height: 200, bytesize: 4_000, placeholder_color: "aabbcc"
+      )
+
+      assert_equal "https://images.example.com/#{own}", Feed.find(feed.id).icon_url
+    end
+  end
+
+  # A podcast's art renders only from its feed_icon row.
+  test "a podcast feed renders its feed_icon row" do
+    feed = create_feeds(users(:ben)).first
+    feed.update!(options: {"itunes_image" => "http://example.com/show.jpg"})
+    assert_nil feed.icon_url
+
+    path = Image.content_storage_path_for(SecureRandom.hex(16), "200x200", "jpg")
+    create_image_row(
+      provider: :feed_icon, provider_id: feed.id.to_s, feed_id: feed.id,
+      url: "http://example.com/show.jpg", variant: "200x200", storage_path: path
+    )
+
+    with_env("UNIFIED_IMAGE_HOST" => "https://images.example.com") do
+      assert_equal "https://images.example.com/#{path}", Feed.find(feed.id).icon_url
+    end
+  end
+
+  # The shape comes from the same row icon_url serves, in the same order, so
+  # the url and the frame can never disagree.
+  test "icon_format reads the kind of the feed's own row" do
+    feed = create_feeds(users(:ben)).first
+    create_image_row(
+      provider: :feed_icon, provider_id: feed.id.to_s, feed_id: feed.id, kind: :cover_art,
+      url: "http://example.com/show.jpg", variant: "200x200"
+    )
+
+    assert_equal "square", Feed.find(feed.id).icon_format
+  end
+
+  test "icon_format is round for an avatar row" do
+    feed = create_feeds(users(:ben)).first
+    create_image_row(
+      provider: :feed_icon, provider_id: feed.id.to_s, feed_id: feed.id, kind: :avatar,
+      url: "http://example.com/me.png", variant: "200x200"
+    )
+
+    assert_equal "round", Feed.find(feed.id).icon_format
+  end
+
+  test "icon_format falls back to the channel row and is nil with no row" do
+    feed = Feed.create!(feed_url: "https://www.youtube.com/feeds/videos.xml?channel_id=UCabc")
+    assert_nil Feed.find(feed.id).icon_format
+
+    create_image_row(provider: :embed_icon, provider_id: "UCabc", kind: :avatar, feed_id: nil, variant: "200x200")
+
+    assert_equal "round", Feed.find(feed.id).icon_format
+  end
+
+  test "icon_format and icon_url resolve the same row when both exist" do
+    with_env("UNIFIED_IMAGE_HOST" => "images.example.com") do
+      feed = Feed.create!(feed_url: "https://www.youtube.com/feeds/videos.xml?channel_id=UCabc")
+      own = create_image_row(
+        provider: :feed_icon, provider_id: feed.id.to_s, feed_id: feed.id, kind: :cover_art,
+        url: "http://example.com/show.jpg", variant: "200x200"
+      )
+      create_image_row(provider: :embed_icon, provider_id: "UCabc", kind: :avatar, feed_id: nil, variant: "200x200")
+
+      assert_equal "https://images.example.com/#{own.storage_path}", Feed.find(feed.id).icon_url
+      assert_equal "square", Feed.find(feed.id).icon_format
+    end
+  end
+
+  # The parser's test on the parsed entries, asked of the stored ones: a
+  # micropost feed is one with entries and no titles.
+  test "micropost? is true only when the feed has entries and none has a title" do
+    feed = Feed.create!(feed_url: Faker::Internet.url)
+    assert_not feed.micropost?, "no entries is not a micropost feed"
+
+    untitled = create_entry(feed)
+    untitled.update!(title: nil)
+    assert Feed.find(feed.id).micropost?
+
+    create_entry(feed).update!(title: "A titled post")
+    assert_not Feed.find(feed.id).micropost?
+  end
+
+  # Feed create is one of the two live triggers; the other is subscribe.
+  # There is no crawl-time trigger, the same limit podcast art has.
+  test "creating a feed enqueues the feed icon crawler beside the podcast one" do
+    Sidekiq::Worker.clear_all
+
+    feed = Feed.create!(feed_url: "http://icons.example.com/feed.json")
+
+    assert_equal [feed.id], ImageCrawler::FeedIcon.jobs.map { it["args"].first }
+    assert_equal [feed.id], ImageCrawler::ItunesFeedImage.jobs.map { it["args"].first }
+  end
+
+  # The subscribe path creates the feed and its entries in one call, so the
+  # receiver never runs for them; the same job runs from here.
+  test "create_from_parsed_feed enqueues the micropost avatar crawler for a micropost feed" do
+    Sidekiq::Worker.clear_all
+    parsed = Struct.new(:entries, :feed_hash) do
+      def to_feed = feed_hash
+    end
+    untitled = Struct.new(:title, :entry_hash) do
+      def to_entry = entry_hash
+    end
+    author = {"author" => {"name" => "Someone", "avatar" => "https://micro.example/a.png", "_microblog" => {"username" => "someone"}}}
+    entry = untitled.new(nil, {public_id: SecureRandom.hex, entry_id: SecureRandom.hex, url: "https://micro.example/1", content: "<p>hi</p>", published: Time.now, data: author})
+    feed = Feed.create_from_parsed_feed(parsed.new([entry], {feed_url: "https://micro.example/feed.json", title: "Micro"}))
+
+    assert_nil feed.custom_icon_format, "nothing reads the parser marker, so nothing writes it"
+    assert_equal [feed.id, nil, feed.entries.pluck(:id)], ImageCrawler::MicropostAvatar.jobs.sole["args"]
+  end
+
+  # The host's images row, or nothing: the legacy favicons row is gone.
+  test "site_favicon is the host's images row" do
+    feed = create_feeds(users(:ben)).first
+    assert_nil Feed.find(feed.id).site_favicon
+
+    row = create_favicon_row(feed.host)
+    assert_equal row, Feed.find(feed.id).site_favicon
+  end
+
+  # Preload these wherever feeds render in a list, or the icon lookups
+  # become a query per feed.
+  test "ICON_PRELOADS preloads every icon row" do
+    feed = create_feeds(users(:ben)).first
+    create_favicon_row(feed.host)
+    create_image_row(provider: :feed_icon, provider_id: feed.id.to_s, feed_id: feed.id, kind: :cover_art, variant: "200x200")
+    channel = Feed.create!(feed_url: "https://www.youtube.com/feeds/videos.xml?channel_id=UCpreload")
+    create_image_row(provider: :embed_icon, provider_id: "UCpreload", feed_id: nil, kind: :avatar, variant: "200x200")
+    feeds = Feed.where(id: [feed.id, channel.id]).includes(*Feed::ICON_PRELOADS).to_a
+
+    statements = capture_sql do
+      feeds.each do
+        it.site_favicon
+        it.icon_url
+        it.icon_format
+      end
+    end
+
+    assert_empty statements.select { it.match?(/FROM "images"|FROM "favicons"/i) }
+    assert_not_nil feeds.find { it.id == feed.id }.favicon_image_record
+    assert_not_nil feeds.find { it.id == feed.id }.icon_image_record
+    assert_not_nil feeds.find { it.id == channel.id }.channel_image_record
+  end
+
+  test "a feed with no host has no favicon row" do
+    feed = create_feeds(users(:ben)).first
+    create_favicon_row(feed.host)
+    feed.update_column(:host, nil)
+
+    assert_nil Feed.find(feed.id).favicon_image_record
+    assert_nil Feed.find(feed.id).site_favicon
+  end
+
+  # Every shape a feed can hand us for an icon, resolved against the feed's
+  # own url. A plain relative path is the one that used to break: the
+  # heuristic parser read "icon.png" as a host and produced http://icon.png.
+  test "feed_relative_url with strict: reads every relative shape as a path" do
+    feed = Feed.new(feed_url: "https://example.com/blog/feed/index.json")
+
+    assert_equal "https://example.com/icon.png", feed.feed_relative_url("/icon.png", strict: true)
+    assert_equal "https://example.com/blog/feed/icon.png", feed.feed_relative_url("icon.png", strict: true)
+    assert_equal "https://example.com/blog/icon.png", feed.feed_relative_url("../icon.png", strict: true)
+    assert_equal "https://cdn.example.net/icon.png", feed.feed_relative_url("//cdn.example.net/icon.png", strict: true)
+    assert_equal "https://cdn.example.net/icon.png", feed.feed_relative_url("https://cdn.example.net/icon.png", strict: true)
+    assert_equal "https://example.com/icon.png", feed.feed_relative_url("  /icon.png ", strict: true)
+  end
+
+  # feedkit stores a feed's <link> as the feed wrote it, and a link without
+  # a scheme is a host. The site url, the host a new feed stores, and the
+  # entry links resolved against the site url all read it that way.
+  test "site_url reads a scheme-less link as a host" do
+    feed = Feed.new(feed_url: "https://feeds.feedburner.com/example", site_url: "www.example.com")
+
+    assert_equal "http://www.example.com", feed.site_url
+  end
+
+  # The root still goes through the heuristic parser: a feed url stored
+  # without a scheme resolves as before.
+  test "feed_relative_url keeps a scheme-less root working" do
+    feed = Feed.new(feed_url: "example.com/feed.xml")
+
+    assert_equal "http://example.com/icon.png", feed.feed_relative_url("/icon.png")
+  end
+end

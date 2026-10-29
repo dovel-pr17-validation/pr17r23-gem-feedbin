@@ -1,0 +1,231 @@
+require "test_helper"
+
+class TweetTest < ActiveSupport::TestCase
+  def make_tweet(option: "one", overrides: {}, image: nil, link_image: nil)
+    tweet_data = load_tweet(option)
+    tweet_data.merge!(overrides)
+    Tweet.new({"tweet" => tweet_data}, image, link_image)
+  end
+
+  test "main_tweet returns the wrapped tweet when not a retweet" do
+    tweet = make_tweet
+    assert_equal tweet.tweet, tweet.main_tweet
+  end
+
+  test "main_tweet returns retweeted_status when present" do
+    base = load_tweet("one")
+    base.delete("quoted_status")
+    base["retweeted_status"] = base.merge("id" => 12345, "full_text" => "Original")
+    base["retweeted_status"]["entities"] = base["entities"]
+    tweet = Tweet.new({"tweet" => base}, nil)
+    assert tweet.tweet.retweeted_status?
+    assert_equal 12345, tweet.main_tweet.id
+  end
+
+  test "retweet? mirrors tweet.retweeted_status?" do
+    tweet = make_tweet
+    refute tweet.retweet?
+  end
+
+  test "method_missing forwards to underlying Twitter::Tweet" do
+    tweet = make_tweet
+    assert_equal tweet.tweet.id, tweet.id
+  end
+
+  test "tweet_summary returns visible-text portion of the tweet" do
+    tweet = make_tweet
+    summary = tweet.tweet_summary
+    assert_kind_of String, summary
+    assert summary.length > 0
+  end
+
+  test "tweet_text returns auto-linked HTML when entities are present" do
+    tweet = make_tweet(overrides: {
+      "full_text" => "hello https://t.co/abcdefghij",
+      "display_text_range" => [0, 29],
+      "entities" => {"urls" => [{
+        "url" => "https://t.co/abcdefghij",
+        "expanded_url" => "https://example.com/story",
+        "display_url" => "example.com/story",
+        "indices" => [6, 29]
+      }]}
+    })
+    text = tweet.tweet_text(tweet.main_tweet)
+    assert_match %r{\Ahello <a [^>]*href="https://t.co/abcdefghij"[^>]*>.*example.com/story.*</a>\z}, text
+  end
+
+  test "tweet_text falls back to full_text when entities are missing" do
+    raw = load_tweet("one")
+    raw.delete("entities")
+    raw.delete("quoted_status")
+    twitter = Twitter::Tweet.new(raw.deep_symbolize_keys)
+    tweet = make_tweet
+    text = tweet.tweet_text(twitter)
+    assert_equal raw["full_text"], text.strip
+  end
+
+  test "twitter_media? returns true when media is present on main tweet" do
+    tweet = make_tweet
+    tweet.main_tweet.stub :media?, true do
+      assert tweet.twitter_media?
+    end
+  end
+
+  test "twitter_media? returns true when an external (non-twitter.com) URL is present" do
+    raw = load_tweet("one")
+    raw.delete("quoted_status")
+    raw["entities"]["urls"] = [{
+      "display_url" => "example.com",
+      "indices" => [0, 10],
+      "url" => "https://t.co/abc",
+      "expanded_url" => "https://example.com/article"
+    }]
+    tweet = Tweet.new({"tweet" => raw}, nil)
+    tweet.main_tweet.stub :media?, false do
+      assert tweet.twitter_media?
+    end
+  end
+
+  test "twitter_media? returns false when there are no urls and no media" do
+    raw = load_tweet("one")
+    raw.delete("quoted_status")
+    raw["entities"]["urls"] = []
+    tweet = Tweet.new({"tweet" => raw}, nil)
+    tweet.main_tweet.stub :media?, false do
+      refute tweet.twitter_media?
+    end
+  end
+
+  test "link_tweet? is false when main tweet has a quoted status" do
+    tweet = make_tweet
+    tweet.main_tweet.stub :quoted_status?, true do
+      refute tweet.link_tweet?
+    end
+  end
+
+  test "link_tweet? is true when main tweet has exactly one url and no quoted status" do
+    tweet = make_tweet
+    fake_url = OpenStruct.new
+    tweet.main_tweet.stub :quoted_status?, false do
+      tweet.main_tweet.stub :urls, [fake_url] do
+        assert tweet.link_tweet?
+      end
+    end
+  end
+
+  test "link_preview? returns false when image is set" do
+    fake_url = OpenStruct.new(expanded_url: URI.parse("https://example.com/p"), indices: [0, 10])
+    tweet = make_tweet(image: "/img.png", link_image: Object.new)
+    tweet.main_tweet.stub :urls, [fake_url] do
+      tweet.stub :link_tweet?, true do
+        tweet.data["saved_pages"] = {"https://example.com/p" => {"result" => {"ok" => true}}}
+        refute tweet.link_preview?
+      end
+    end
+  end
+
+  test "link_preview? returns false when not a link tweet" do
+    fake_url = OpenStruct.new(expanded_url: URI.parse("https://example.com/p"), indices: [0, 10])
+    tweet = make_tweet(link_image: Object.new)
+    tweet.main_tweet.stub :urls, [fake_url] do
+      tweet.stub :link_tweet?, false do
+        tweet.data["saved_pages"] = {"https://example.com/p" => {"result" => {"ok" => true}}}
+        refute tweet.link_preview?
+      end
+    end
+  end
+
+  test "link_preview? returns false when saved_pages has an error" do
+    fake_url = OpenStruct.new(expanded_url: URI.parse("https://example.com/p"), indices: [0, 10])
+    tweet = make_tweet(link_image: Object.new)
+    tweet.main_tweet.stub :urls, [fake_url] do
+      tweet.stub :link_tweet?, true do
+        tweet.data["saved_pages"] = {"https://example.com/p" => {"result" => {"error" => "boom"}}}
+        refute tweet.link_preview?
+      end
+    end
+  end
+
+  # The legacy data key is inert since the S3 backfill; only the link row
+  # gates a preview now.
+  test "link_preview? ignores the legacy data key without a link row" do
+    fake_url = OpenStruct.new(expanded_url: URI.parse("https://example.com/p"), indices: [0, 10])
+    tweet = make_tweet
+    tweet.main_tweet.stub :urls, [fake_url] do
+      tweet.stub :link_tweet?, true do
+        tweet.data.merge!(
+          "saved_pages" => {"https://example.com/p" => {"result" => {"ok" => true}}},
+          "twitter_link_image_processed" => "x"
+        )
+        refute tweet.link_preview?
+      end
+    end
+  end
+
+  # The pipeline stores the image on a row, not in
+  # twitter_link_image_processed; the gate must accept the row too, or
+  # previews for every newly crawled entry silently stop rendering.
+  test "link_preview? accepts a stored link image row in place of the legacy data key" do
+    fake_url = OpenStruct.new(expanded_url: URI.parse("https://example.com/p"), indices: [0, 10])
+    tweet = make_tweet(link_image: Object.new)
+    tweet.main_tweet.stub :urls, [fake_url] do
+      tweet.stub :link_tweet?, true do
+        tweet.data.merge!("saved_pages" => {"https://example.com/p" => {"result" => {"ok" => true}}})
+        assert tweet.link_preview?
+      end
+    end
+  end
+
+  test "tweet_text leaves the tweet's own entities alone" do
+    tweet = make_tweet
+    before = tweet.main_tweet.to_h[:entities][:urls].map { _1[:url] }
+
+    tweet.tweet_text(tweet.main_tweet)
+
+    assert_equal before, tweet.main_tweet.to_h[:entities][:urls].map { _1[:url] }
+  end
+
+  test "urls are still readable after the tweet has been rendered" do
+    untouched = make_tweet
+    expected = untouched.main_tweet.urls.map { _1.url.to_s }
+
+    rendered = make_tweet
+    rendered.tweet_text(rendered.main_tweet)
+
+    assert_equal expected, rendered.main_tweet.urls.map { _1.url.to_s }
+  end
+
+  # A tweet captured without extended mode has no display_text_range, and on
+  # that branch trim_text handed back the tweet's own full_text String -- so
+  # summarising a tweet rewrote the text it was summarising, leaving the entity
+  # indices pointing at offsets that no longer exist.
+  test "tweet_summary leaves the tweet's own text alone" do
+    data = load_tweet("one")
+    data.delete("display_text_range")
+    tweet = Tweet.new({"tweet" => data}, nil)
+    before = tweet.main_tweet.to_h[:full_text].dup
+
+    tweet.tweet_summary
+
+    assert_equal before, tweet.main_tweet.to_h[:full_text]
+  end
+
+  test "tweet_text renders a reply the same way twice" do
+    reply = load_tweet("one")
+    reply["full_text"] = "hello https://t.co/abcdefghij"
+    reply["display_text_range"] = [0, 29]
+    reply["entities"] = {"urls" => [{
+      "url" => "https://t.co/abcdefghij",
+      "expanded_url" => "https://example.com/story",
+      "display_url" => "example.com/story",
+      "indices" => [6, 29]
+    }]}
+    reply["display_text_range"] = [6, 29]
+    tweet = Tweet.new({"tweet" => reply}, nil)
+
+    first = tweet.tweet_text(tweet.main_tweet)
+    second = tweet.tweet_text(tweet.main_tweet)
+
+    assert_equal first, second
+  end
+end

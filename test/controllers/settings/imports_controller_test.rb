@@ -1,0 +1,137 @@
+require "test_helper"
+
+class Settings::ImportsControllerTest < ActionController::TestCase
+  setup do
+    @user = users(:ben)
+  end
+
+  test "should get import_export" do
+    import = @user.imports.new(filename: "subscriptions.opml")
+    import.import_items.new(details: {xml_url: "http://example.com/feed.xml"})
+    import.save!
+
+    login_as @user
+    get :index
+    assert_response :success
+    assert_select "a[data-method=delete][href=?]", settings_import_path(import)
+  end
+
+  test "should import" do
+    login_as @user
+
+    assert_difference -> { ImportItem.count }, +1 do
+      assert_difference -> { Tag.count }, +2 do
+        assert_difference -> { Import.count }, +1 do
+          post :create, params: {
+            import: {
+              upload: fixture_file_upload("subscriptions.xml", "application/xml")
+            }
+          }
+        end
+      end
+    end
+    assert_redirected_to settings_import_url(Import.last)
+    item = ImportItem.last
+    assert_equal ["Tag One", "Tag Two"], item.details[:tag]
+  end
+
+  test "should show a report whose OPML outlines had text but no title" do
+    login_as @user
+
+    import = @user.imports.new(filename: "subscriptions.opml")
+    import.import_items.new(status: :failed, details: {
+      title: "Has a title", text: "Has a title",
+      xml_url: "http://a.example.com/feed.xml", html_url: "http://a.example.com/"
+    })
+    # text is the required OPML attribute; title is optional.
+    import.import_items.new(status: :failed, details: {
+      text: "Only text",
+      xml_url: "http://b.example.com/feed.xml", html_url: "http://b.example.com/"
+    })
+    import.save!
+    import.update_column(:complete, true)
+
+    get :show, params: {id: import.id}
+
+    assert_response :success
+    assert_includes @response.body, "Only text"
+  end
+
+  test "replace_all leaves the items fixable until the jobs have run" do
+    login_as @user
+
+    import = @user.imports.new(filename: "subscriptions.opml")
+    item = import.import_items.new(status: :fixable, details: {
+      title: "Example",
+      xml_url: "http://example.com/feed.xml", html_url: "http://example.com/"
+    })
+    import.save!
+    DiscoveredFeed.create!(site_url: item.site_url, feed_url: "http://example.com/alternative.xml")
+
+    assert_difference -> { FeedImportFixer.jobs.size }, +1 do
+      post :replace_all, params: {id: import.id}
+    end
+
+    assert item.reload.fixable?
+  end
+
+  test "should destroy import" do
+    login_as @user
+
+    import = @user.imports.new(filename: "subscriptions.opml")
+    import.import_items.new(status: :complete, details: {
+      title: "Example",
+      xml_url: "http://example.com/feed.xml", html_url: "http://example.com/"
+    })
+    import.save!
+
+    assert_difference -> { Import.count } => -1, -> { ImportItem.count } => -1 do
+      delete :destroy, params: {id: import.id}
+    end
+
+    assert_redirected_to settings_import_export_url
+  end
+
+  test "should not destroy another user's import" do
+    login_as @user
+
+    import = users(:new).imports.new(filename: "subscriptions.opml")
+    import.import_items.new(details: {xml_url: "http://example.com/feed.xml"})
+    import.save!
+
+    assert_raises(ActiveRecord::RecordNotFound) do
+      delete :destroy, params: {id: import.id}
+    end
+    assert Import.exists?(import.id)
+  end
+
+  test "should show import error" do
+    login_as @user
+
+    assert_no_difference -> { Import.count } do
+      post :create, params: {
+        import: {
+          upload: nil
+        }
+      }
+    end
+
+    assert_redirected_to settings_import_export_url
+    assert_equal "No file uploaded.", flash[:alert]
+  end
+
+  test "should show empty import error" do
+    login_as @user
+
+    assert_no_difference -> { Import.count } do
+      post :create, params: {
+        import: {
+          upload: fixture_file_upload("empty.xml", "application/xml")
+        }
+      }
+    end
+
+    assert_redirected_to settings_import_export_url
+    assert_equal "No feeds found.", flash[:error].strip
+  end
+end

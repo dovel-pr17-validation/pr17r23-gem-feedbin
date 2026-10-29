@@ -1,0 +1,197 @@
+require "application_system_test_case"
+
+class ArticleTest < ApplicationSystemTestCase
+  test "Show article" do
+    show_article
+    assert_text @entries.first.content
+  end
+
+  test "Show tweet" do
+    @user = users(:ben)
+    @feed = create_feeds(@user, 1).first
+
+    entry = create_tweet_entry(@user.feeds.first)
+
+    login_as(@user)
+
+    click_link(entry.tweet.tweet_summary)
+
+    assert_selector ".tweet-text", text: entry.tweet.tweet_summary
+  end
+
+  test "star" do
+    show_article
+    assert_difference "StarredEntry.count", +1 do
+      find("[data-behavior~=toggle_starred]:not(.starred)")
+      find("[data-behavior~=toggle_starred] button").click
+      wait_for_ajax
+      find("[data-behavior~=toggle_starred].starred")
+    end
+  end
+
+  test "mark unread" do
+    show_article
+    wait_for_ajax
+
+    assert_difference "UnreadEntry.count", +1 do
+      find("[data-behavior~=toggle_read] button").click
+      wait_for_ajax
+    end
+  end
+
+  test "media embed" do
+    show_article_setup
+
+    stub_request_file("oembed.json", /www\.youtube\.com/, headers: {"Content-Type" => "application/json; charset=utf-8"})
+    stub_request(:head, /i\.ytimg\.com/).to_return(status: 200, body: "", headers: {})
+
+    @entries.first.update(content: %(Iframe <iframe src="http://www.youtube.com/embed/1234"></iframe>))
+
+    login_as(@user)
+
+    click_link(@entries.first.title)
+
+    wait_for_ajax
+
+    assert_text "Samsung Galaxy Note 9 Impressions: Underrated!"
+  end
+
+  test "twitter embed" do
+    show_article_setup
+
+    entry = create_tweet_entry(@entries.first.feed)
+
+    SaveTwitterUsers.new.perform(entry.id)
+
+    stub_request_file("twitter_oembed.json", /publish\.twitter\.com/, headers: {"Content-Type" => "application/json; charset=utf-8"})
+
+    @entries.first.update(content: %(Tweet <blockquote class="twitter-tweet"><a href="https://twitter.com/9to5mac/status/1280625051822436353">May 24, 2019</a></blockquote>))
+
+    login_as(@user)
+
+    click_link(@entries.first.title)
+
+    wait_for_ajax
+
+    # The icons path sends a miss to camo, which cannot load in a test, so
+    # the default avatar takes its place. TwitterEmbedPartialTest checks the
+    # path itself.
+    assert_selector ".profile-image img[src*='favicon-profile-default']"
+    assert_selector ".tweet-body", text: "iOS 14 will let you"
+  end
+
+  test "diff" do
+    show_article_setup
+
+    entry = @entries.first
+
+    entry.update(content: "<p>This is the text.</p>")
+    new_content = "<p>This is the new text.</p>"
+    entry.update(content: new_content, compressed_original_content: OriginalContent.compress(entry.content, base: new_content))
+
+    login_as(@user)
+
+    click_link(@entries.first.title)
+
+    wait_for_ajax
+
+    find("label[for=diff_view]").click
+
+    assert_selector "ins", text: "new"
+  end
+
+  test "direct link" do
+    show_article_setup
+
+    entry = @entries.first
+
+    login_as(@user)
+
+    visit entry_path(entry)
+
+    assert_selector "#source_link h1", text: entry.title
+  end
+
+  test "newsletter" do
+    show_article_setup
+
+    entry = @entries.first
+    entry.feed.newsletter!
+
+    login_as(@user)
+
+    click_link(@entries.first.title)
+
+    wait_for_ajax
+
+    find('label[for=newsletter_view]').click()
+
+    assert_selector ".newsletter-content"
+  end
+
+  test "extract" do
+    show_article
+    wait_for_ajax
+
+    stub_request_file("parsed_page.json", /extract\.example\.com/, headers: {"Content-Type" => "application/json; charset=utf-8"})
+
+    find(".button-toggle-content").click
+
+    assert_selector ".original-meta strong", text: "Originally from:"
+  end
+
+  test "settings menu opens from the entry toolbar and closes with escape" do
+    show_article
+    wait_for_ajax
+
+    find(".entry-toolbar [data-behavior~=toggle_settings_menu]").click
+    assert_selector ".settings-menu", text: "Subscriptions"
+
+    find("body").send_keys(:escape)
+    assert_no_selector ".settings-menu", visible: true
+  end
+
+  test "settings menu closes when another entry opens" do
+    show_article_setup
+    other_entry = create_entry(@feed)
+    login_as(@user)
+    click_link(@entries.first.title)
+    wait_for_ajax
+
+    find(".entry-toolbar [data-behavior~=toggle_settings_menu]").click
+    assert_selector ".settings-menu", text: "Subscriptions"
+
+    click_link(other_entry.title)
+    assert_selector ".entry-toolbar", count: 1
+    assert_selector "#source_link h1", text: other_entry.title
+    assert_no_selector ".settings-menu", visible: true
+  end
+
+  test "settings menu opens from the account toolbar" do
+    show_article_setup
+    login_as(@user)
+
+    find(".account-toolbar [data-behavior~=toggle_settings_menu]").click
+    assert_selector ".settings-menu", text: "Subscriptions"
+  end
+
+  test "settings menu and format menu are not open together" do
+    show_article
+    wait_for_ajax
+
+    find(".entry-toolbar [data-behavior~=toggle_format_menu]").click
+    assert_selector ".format-palette", visible: true
+
+    find(".entry-toolbar [data-behavior~=toggle_settings_menu]").click
+    assert_selector ".settings-menu", text: "Subscriptions"
+    assert_no_selector ".format-palette", visible: true
+  end
+
+  test "page renders one settings menu" do
+    show_article
+    wait_for_ajax
+
+    assert_selector "[data-behavior~=toggle_settings_menu]", minimum: 2, visible: :all
+    assert_selector "[data-nav=dropdown]", count: 1, visible: :all
+  end
+end

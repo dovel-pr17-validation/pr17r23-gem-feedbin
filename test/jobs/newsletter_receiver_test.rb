@@ -1,0 +1,287 @@
+require "test_helper"
+
+class NewsletterReceiverTest < ActiveSupport::TestCase
+  setup do
+    Sidekiq::Worker.clear_all
+    @user = users(:ben)
+    @token = @user.newsletter_authentication_token.token
+    @newsletter_text = File.read(support_file("email_text.eml"))
+    @newsletter_html = File.read(support_file("email_html.eml"))
+
+    @file_url_html = "https://bucket.s3.amazonaws.com/path.to.html.email"
+    stub_request_file("email_html.eml", @file_url_html)
+    stub_request(:delete, @file_url_html).to_return(status: 204)
+
+    @file_url_text = "https://bucket.s3.amazonaws.com/path.to.text.email"
+    stub_request_file("email_text.eml", @file_url_text)
+    stub_request(:delete, @file_url_text).to_return(status: 204)
+
+    @s3_url_html = "s3://bucket/path.to.html.email"
+    @s3_url_text = "s3://bucket/path.to.text.email"
+  end
+
+  test "creates newsletters with new feed and receiver" do
+    assert_difference "Subscription.count", +1 do
+      assert_difference "NewsletterSaver.jobs.size", +1 do
+        assert_difference("NewsletterSender.count", 1) do
+          assert_difference("Entry.count", 1) do
+            NewsletterReceiver.new.perform(@token, @s3_url_html)
+          end
+        end
+      end
+    end
+    assert @user.feeds.newsletter.exists?
+  end
+
+  test "creates newsletters with new feed and processor" do
+    Sidekiq::Worker.clear_all
+    user = users(:ben)
+    full_token = "#{@token}+miscexample.com"
+    assert_difference "Subscription.count", +1 do
+      assert_difference "NewsletterSaver.jobs.size", +1 do
+        assert_difference("NewsletterSender.count", 1) do
+          assert_difference("Entry.count", 1) do
+            assert_difference("AuthenticationToken.count", 1) do
+              NewsletterReceiver.new.perform("#{@token}+miscexample.com", @s3_url_html)
+            end
+          end
+        end
+      end
+    end
+
+    assert user.feeds.newsletter.exists?
+    assert AuthenticationToken.find_by_token(full_token).present?
+    assert_requested :delete, @file_url_html
+  end
+
+
+  test "doesn't create subscription if unsubscribed" do
+    newsletter = EmailNewsletter.new(Mail.from_source(@newsletter_text), @token)
+    feed = Feed.create!(feed_url: newsletter.feed_url)
+
+    assert_no_difference("Subscription.count") do
+      NewsletterReceiver.new.perform(@token, @s3_url_html)
+    end
+    assert !feed.newsletter_sender.active?, "Sender should not be active."
+  end
+
+  test "creates newsletters with old token" do
+    assert_difference "Subscription.count", +1 do
+      assert_difference "NewsletterSaver.jobs.size", +1 do
+        assert_difference("NewsletterSender.count", 1) do
+          assert_difference("Entry.count", 1) do
+            NewsletterReceiver.new.perform("subscribe+#{@token}", @s3_url_html)
+          end
+        end
+      end
+    end
+    assert @user.feeds.newsletter.exists?
+  end
+
+  test "puts newsletter in tag" do
+    newsletter = EmailNewsletter.new(Mail.from_source(@newsletter_text), @token)
+
+    tag = "Newsletters"
+    @user.newsletter_authentication_token.update(newsletter_tag: tag)
+
+    feed = Feed.create!(feed_url: newsletter.feed_url)
+    @user.subscriptions.find_or_create_by(feed: feed)
+
+    assert_difference("Tag.count", 1) do
+      assert_difference("Entry.count", 1) do
+        NewsletterReceiver.new.perform(@token, @s3_url_text)
+      end
+    end
+  end
+
+  test "does not tag newsletter that already is" do
+    newsletter = EmailNewsletter.new(Mail.from_source(@newsletter_text), @token)
+
+    tag = "Newsletters"
+    @user.newsletter_authentication_token.update(newsletter_tag: tag)
+
+    feed = Feed.create!(feed_url: newsletter.feed_url)
+    @user.subscriptions.find_or_create_by(feed: feed)
+    feed.tag("New Tag", @user)
+
+    assert_no_difference("Tag.count") do
+      assert_difference("Entry.count", 1) do
+        NewsletterReceiver.new.perform(@token, @s3_url_html)
+      end
+    end
+  end
+
+  test "creates newsletters with existing feed" do
+    newsletter = EmailNewsletter.new(Mail.from_source(@newsletter_text), @token)
+
+    feed = Feed.create!(feed_url: newsletter.feed_url)
+    @user.subscriptions.find_or_create_by(feed: feed)
+
+    assert_difference("Entry.count", 1) do
+      NewsletterReceiver.new.perform(@token, @s3_url_text)
+    end
+  end
+
+  test "updates the title and type of an existing feed" do
+    newsletter = EmailNewsletter.new(Mail.from_source(@newsletter_text), @token)
+    feed = Feed.create!(feed_url: newsletter.feed_url, title: "Old title")
+
+    assert_difference("Entry.count", 1) do
+      NewsletterReceiver.new.perform(@token, @s3_url_html)
+    end
+
+    feed.reload
+    assert_equal "Ben Ubois", feed.title
+    assert_equal "newsletter", feed.feed_type
+  end
+
+  test "stores the sender and recipient, not the raw source or the text part" do
+    NewsletterReceiver.new.perform(@token, @s3_url_html)
+
+    entry = Entry.last
+    assert_nil entry.settings["newsletter"]
+    assert_equal "Ben Ubois <ben@benubois.com>", entry.newsletter_from
+    assert_equal "token@newsletters.feedbin.com", entry.newsletter_to
+    assert_equal @token, entry.newsletter_token
+    assert_equal({"type" => "newsletter", "format" => "html", "newsletter_to" => @token}, entry.data)
+  end
+
+  test "stores a newsletter whose body carries a NUL byte" do
+    url = "https://bucket.s3.amazonaws.com/path.to.nul.email"
+    stub_request(:get, url).to_return(status: 200, body: <<~EMAIL.gsub("\n", "\r\n"))
+      From: News <news@example.com>
+      To: #{@token}@newsletters.feedbin.com
+      Subject: Hi
+      Content-Type: text/plain; charset=UTF-8
+
+      before\0after
+    EMAIL
+    stub_request(:delete, url).to_return(status: 204)
+
+    assert_difference "Entry.count", +1 do
+      NewsletterReceiver.new.perform(@token, "s3://bucket/path.to.nul.email")
+    end
+
+    assert_requested :delete, url
+  end
+
+  test "stores a newsletter whose subject carries a NUL byte" do
+    url = "https://bucket.s3.amazonaws.com/path.to.nul.subject.email"
+    stub_request(:get, url).to_return(status: 200, body: <<~EMAIL.gsub("\n", "\r\n"))
+      From: News <news@example.com>
+      To: #{@token}@newsletters.feedbin.com
+      Subject: be\0fore
+      Content-Type: text/plain; charset=UTF-8
+
+      body
+    EMAIL
+    stub_request(:delete, url).to_return(status: 204)
+
+    assert_difference "Entry.count", +1 do
+      NewsletterReceiver.new.perform(@token, "s3://bucket/path.to.nul.subject.email")
+    end
+
+    assert_equal "before", Entry.last.title
+  end
+
+  test "declines a message with no usable sender rather than failing the job" do
+    url = "https://bucket.s3.amazonaws.com/path.to.senderless.email"
+    stub_request(:get, url).to_return(status: 200, body: <<~EMAIL.gsub("\n", "\r\n"))
+      From: Some Newsletter
+      To: #{@token}@newsletters.feedbin.com
+      Subject: Hi
+
+      body
+    EMAIL
+    stub_request(:delete, url).to_return(status: 204)
+
+    assert_no_difference ["Entry.count", "Feed.count"] do
+      NewsletterReceiver.new.perform(@token, "s3://bucket/path.to.senderless.email")
+    end
+
+    assert_requested :delete, url
+  end
+
+  test "unstorable_attributes names attributes whose strings are not valid UTF-8" do
+    receiver = NewsletterReceiver.new
+    binary = "Pe\xF1a".dup.force_encoding(Encoding::ASCII_8BIT)
+    invalid_utf8 = "Pe\xF1a".dup.force_encoding(Encoding::UTF_8)
+    attributes = {
+      author: "Clean Author",
+      content: binary,
+      published: Time.now,
+      data: {newsletter_to: invalid_utf8, type: "newsletter"}
+    }
+
+    assert_equal ["content", "data.newsletter_to"], receiver.send(:unstorable_attributes, attributes)
+  end
+
+  test "keeps the source email when the newsletter could not be stored" do
+    losing_race = -> { raise ActiveRecord::RecordNotUnique, "PG::UniqueViolation" }
+
+    assert_no_difference -> { Entry.count } do
+      NewsletterReceiver.stub_any_instance(:subscribe, losing_race) do
+        assert_raises(ActiveRecord::RecordNotUnique) do
+          NewsletterReceiver.new.perform(@token, @s3_url_html)
+        end
+      end
+    end
+
+    assert_not_requested :delete, @file_url_html
+  end
+
+  test "deletes the source email when the same newsletter is already stored" do
+    newsletter = EmailNewsletter.new(Mail.from_source(@newsletter_html), @token)
+    feeds(:daring_fireball).entries.create!(
+      title: "Stored by the delivery that arrived first",
+      public_id: newsletter.entry_id,
+      url: "https://example.com/first"
+    )
+
+    assert_no_difference -> { Entry.count } do
+      NewsletterReceiver.new.perform(@token, @s3_url_html)
+    end
+
+    assert_requested :delete, @file_url_html
+  end
+
+  test "stores nothing and deletes the source email for a token that is not active" do
+    @user.newsletter_authentication_token.update!(active: false)
+
+    assert_no_difference("Entry.count") do
+      NewsletterReceiver.new.perform(@token, @s3_url_html)
+    end
+
+    assert_requested :delete, @file_url_html
+  end
+
+  test "unstorable_attributes is empty when every attribute is storable" do
+    receiver = NewsletterReceiver.new
+    attributes = {author: "José", content: "<p>ok</p>", data: {newsletter_to: "fin"}}
+
+    assert_empty receiver.send(:unstorable_attributes, attributes)
+  end
+
+  test "unstorable_attributes names an attribute carrying a NUL byte" do
+    receiver = NewsletterReceiver.new
+    attributes = {author: "Clean", title: "before\0after", data: {newsletter_to: "also\0bad"}}
+
+    assert_equal ["title", "data.newsletter_to"], receiver.send(:unstorable_attributes, attributes)
+  end
+
+  test "records the failing attributes and re-raises when an entry insert is rejected" do
+    recorded = []
+    rejected_insert = ->(*) { raise ActiveRecord::StatementInvalid, "PG::CharacterNotInRepertoire" }
+
+    ErrorService.stub(:context, ->(params) { recorded << params }) do
+      Entry.stub_any_instance(:save!, rejected_insert) do
+        assert_raises(ActiveRecord::StatementInvalid) do
+          NewsletterReceiver.new.perform(@token, @s3_url_html)
+        end
+      end
+    end
+
+    assert recorded.any? { |params| params.key?(:unstorable_attributes) },
+      "expected ErrorService.context to be given :unstorable_attributes"
+  end
+end

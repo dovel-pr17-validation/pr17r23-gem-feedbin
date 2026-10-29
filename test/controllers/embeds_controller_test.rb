@@ -1,0 +1,93 @@
+require "test_helper"
+
+class EmbedsControllerTest < ActionController::TestCase
+  setup do
+    @user = users(:ben)
+  end
+
+  test "GET twitter requires login" do
+    get :twitter, params: {url: "https://twitter.com/x/status/1"}
+    assert_redirected_to login_url
+  end
+
+  test "GET twitter renders the embed when IframeEmbed::Twitter resolves" do
+    login_as @user
+    fake_media = OpenStruct.new(
+      author_url: "https://twitter.com/x",
+      profile_image_url: "https://example.com/avatar.png",
+      permalink: "https://twitter.com/x/status/1",
+      name: "Embedded Author",
+      screen_name: "@x",
+      date: Time.utc(2026, 1, 2),
+      content: "Tweet text",
+      image_url: nil
+    )
+    IframeEmbed::Twitter.stub :download, ->(_) { fake_media } do
+      get :twitter, params: {url: "https://twitter.com/x/status/1", dom_id: "e1"}, xhr: true
+    end
+    assert_response :success
+    assert_equal fake_media, assigns(:media)
+    assert_includes @response.body, "Embedded Author"
+  end
+
+  test "GET twitter quietly returns 200 when JSON parsing fails" do
+    login_as @user
+    IframeEmbed::Twitter.stub :download, ->(_) { raise JSON::ParserError } do
+      get :twitter, params: {url: "https://twitter.com/x/status/1"}, xhr: true
+    end
+    assert_response :ok
+  end
+
+  test "GET instagram renders the embed when IframeEmbed::Instagram resolves" do
+    login_as @user
+    fake_media = OpenStruct.new
+    IframeEmbed::Instagram.stub :download, ->(_) { fake_media } do
+      get :instagram, params: {url: "https://www.instagram.com/p/ABC/", dom_id: "e2"}, xhr: true
+    end
+    assert_response :success
+    assert_equal fake_media, assigns(:media)
+  end
+
+  test "GET instagram returns 200 on JSON::ParserError" do
+    login_as @user
+    IframeEmbed::Instagram.stub :download, ->(_) { raise JSON::ParserError } do
+      get :instagram, params: {url: "https://www.instagram.com/p/ABC/"}, xhr: true
+    end
+    assert_response :ok
+  end
+
+  test "GET twitter quietly returns 200 when the oembed fetch fails" do
+    login_as @user
+    # UrlCache skips caching failed responses and returns a nil body, so the
+    # JSON.parse in IframeEmbed::Twitter#data raises TypeError, not ParserError.
+    stub_request(:get, /publish\.twitter\.com/).to_return(status: 500)
+    get :twitter, params: {url: "https://twitter.com/x/status/failed-fetch-#{SecureRandom.hex(4)}"}, xhr: true
+    assert_response :ok
+  end
+
+  test "GET instagram quietly returns 200 when the oembed fetch fails" do
+    login_as @user
+    stub_request(:get, /graph\.facebook\.com/).to_return(status: 500)
+    get :instagram, params: {url: "https://www.instagram.com/p/failed-fetch-#{SecureRandom.hex(4)}/"}, xhr: true
+    assert_response :ok
+  end
+
+  test "GET iframe renders the embed when IframeEmbed.fetch resolves" do
+    login_as @user
+    fake_media = OpenStruct.new
+    IframeEmbed.stub :fetch, ->(_) { fake_media } do
+      get :iframe, params: {url: "https://example.com/v"}, xhr: true
+    end
+    assert_response :success
+    assert_equal fake_media, assigns(:media)
+  end
+
+  test "GET iframe renders the error template when fetch raises" do
+    login_as @user
+    IframeEmbed.stub :fetch, ->(_) { raise "boom" } do
+      get :iframe, params: {url: "https://example.com/v"}, xhr: true
+    end
+    assert_response :success
+    assert_equal "example.com", assigns(:host)
+  end
+end

@@ -1,0 +1,77 @@
+require "test_helper"
+
+class FeedImporterTest < ActiveSupport::TestCase
+  setup do
+    @user = users(:new)
+    import = @user.imports.new
+    details = {
+      xml_url: "http://www.example.com/atom.xml",
+      tag: "Favorites",
+      title: "My Title"
+    }
+    @import_item = import.import_items.new(details: details)
+    import.save
+    stub_request_file("atom.xml", @import_item.details[:xml_url])
+  end
+
+  test "should create subscription" do
+    assert_difference "Subscription.count", +1 do
+      FeedImporter.new.perform(@import_item.id)
+    end
+    assert_equal("complete", @import_item.reload.status)
+  end
+
+  test "should tag subscription" do
+    assert_difference "Tag.count", +1 do
+      FeedImporter.new.perform(@import_item.id)
+    end
+  end
+
+  test "should skip an item whose import was deleted" do
+    @import_item.import.destroy!
+    assert_no_difference "Subscription.count" do
+      FeedImporter.new.perform(@import_item.id)
+    end
+  end
+
+  test "should mark failed" do
+    import = @user.imports.new
+    details = {xml_url: "http://www.example.com/atom.xml"}
+    import_item = import.import_items.new(details: details)
+    import.save
+    stub_request(:get, import_item.details[:xml_url]).to_return(status: 404)
+    FeedImporter.new.perform(import_item.id)
+    assert_equal("failed", import_item.reload.status)
+  end
+
+  test "should complete import when last item hits RecordNotUnique" do
+    feed = feeds(:daring_fireball)
+    feed.stub(:tag, ->(*) { raise ActiveRecord::RecordNotUnique }) do
+      FeedFinder.stub(:feeds, [feed]) do
+        FeedImporter.new.perform(@import_item.id)
+      end
+    end
+    assert_equal("complete", @import_item.reload.status)
+    assert @import_item.import.reload.complete?
+  end
+
+  test "should complete import when last item fails unexpectedly" do
+    feed = feeds(:daring_fireball)
+    feed.stub(:tag, ->(*) { raise "boom" }) do
+      FeedFinder.stub(:feeds, [feed]) do
+        assert_raises(RuntimeError) do
+          FeedImporter.new.perform(@import_item.id)
+        end
+      end
+    end
+    assert_equal("failed", @import_item.reload.status)
+    assert @import_item.import.reload.complete?
+  end
+
+  test "should title subscription" do
+    FeedImporter.new.perform(@import_item.id)
+    feed = Feed.where(feed_url: @import_item.details[:xml_url]).take!
+    subscription = @user.subscriptions.where(feed: feed).take!
+    assert_equal(@import_item.details[:title], subscription.title)
+  end
+end

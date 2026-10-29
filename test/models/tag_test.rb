@@ -1,0 +1,110 @@
+require "test_helper"
+
+class TagTest < ActiveSupport::TestCase
+  setup do
+    @user = users(:new)
+    @feed = create_feeds(@user, 1).first
+  end
+
+  test "rename moves taggings from the old tag to the new tag" do
+    old_tag = Tag.create!(name: "OldTag")
+    @user.taggings.create!(tag: old_tag, feed: @feed)
+
+    Tag.rename(@user, old_tag, "NewTag")
+
+    new_tag = Tag.find_by(name: "NewTag")
+    refute_nil new_tag
+    assert_equal 0, @user.taggings.where(tag: old_tag).count
+    assert_equal 1, @user.taggings.where(tag: new_tag).count
+  end
+
+  test "rename strips commas and surrounding whitespace from the new name" do
+    old_tag = Tag.create!(name: "Old")
+    @user.taggings.create!(tag: old_tag, feed: @feed)
+
+    new_tag = Tag.rename(@user, old_tag, "  No, Commas  ")
+    assert_equal "No Commas", new_tag.name
+  end
+
+  test "rename reuses an existing tag with the new name" do
+    old_tag = Tag.create!(name: "Old")
+    existing = Tag.create!(name: "Existing")
+    @user.taggings.create!(tag: old_tag, feed: @feed)
+
+    result = Tag.rename(@user, old_tag, "Existing")
+    assert_equal existing.id, result.id
+  end
+
+  test "rename does not duplicate a tagging the destination tag already has" do
+    old_tag = Tag.create!(name: "Alpha")
+    new_tag = Tag.create!(name: "Beta")
+    @user.taggings.create!(tag: old_tag, feed: @feed)
+    @user.taggings.create!(tag: new_tag, feed: @feed)
+
+    Tag.rename(@user, old_tag, "Beta")
+
+    feed_ids = @user.taggings.where(tag: new_tag).pluck(:feed_id)
+    assert_equal feed_ids.uniq, feed_ids,
+      "a feed in both tags should end up with one tagging, not two"
+  end
+
+  test "rename to the tag's own name keeps the taggings" do
+    tag = Tag.create!(name: "Same")
+    @user.taggings.create!(tag: tag, feed: @feed)
+
+    Tag.rename(@user, tag, "Same")
+
+    assert_equal 1, @user.taggings.where(tag: tag).count
+  end
+
+  test "a name is required" do
+    refute Tag.new(name: "").valid?
+    refute Tag.new(name: "   ").valid?
+  end
+
+  test "a name longer than the column is rejected" do
+    refute Tag.new(name: "x" * 300).valid?, "tags.name is varchar(255) and truncation raises"
+  end
+
+  test "rename leaves the taggings alone when the new name is empty after normalising" do
+    old_tag = Tag.create!(name: "OldTag")
+    @user.taggings.create!(tag: old_tag, feed: @feed)
+
+    assert_no_difference -> { Tag.count } do
+      assert_nil Tag.rename(@user, old_tag, " , ")
+    end
+
+    assert_equal 1, @user.taggings.where(tag: old_tag).count, "the taggings must not move onto a nameless tag"
+  end
+
+  test "rename leaves the taggings alone when the new name is too long" do
+    old_tag = Tag.create!(name: "OldTag")
+    @user.taggings.create!(tag: old_tag, feed: @feed)
+
+    assert_nothing_raised do
+      assert_nil Tag.rename(@user, old_tag, "x" * 300)
+    end
+
+    assert_equal 1, @user.taggings.where(tag: old_tag).count
+  end
+
+  test "destroy removes the user's taggings for the given tag" do
+    tag = Tag.create!(name: "ToDelete")
+    @user.taggings.create!(tag: tag, feed: @feed)
+
+    Tag.destroy(@user, tag)
+
+    assert_equal 0, @user.taggings.where(tag: tag).count
+  end
+
+  test "sourceable returns a Sourceable describing the tag" do
+    tag = Tag.create!(name: "Tech")
+    sourceable = tag.sourceable
+
+    assert_instance_of Sourceable, sourceable
+    assert_equal "tag", sourceable.type
+    assert_equal "Tech", sourceable.title
+    assert_equal "Tags", sourceable.section
+    assert_equal true, sourceable.jumpable
+  end
+end

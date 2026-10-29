@@ -1,0 +1,52 @@
+class MutesController < ApplicationController
+  layout "settings"
+
+  before_action :set_action, only: [:destroy]
+
+  def index
+    @mutes = @user.actions.mute.natural_sort_by { |action| action.title }
+  end
+
+  def create
+    @user = current_user
+    @action = @user.actions.new(
+      query: params[:query],
+      all_feeds: params[:all_feeds] == "true" ? true : false,
+      # Array() rather than [], which turns a missing parameter into [nil] --
+      # a NULL that compute_feed_ids drops with blank? and the preview template
+      # then calls empty? on.
+      feed_ids: Array(params[:feed_id]),
+      action_type: Action.action_types[:mute],
+      actions: ["mark_read"],
+      apply_action: "1"
+    )
+    if params[:button_action] == "save"
+      if !@action.save
+        flash[:error] = @action.errors.full_messages.join(". ")
+      end
+      flash.discard
+    else
+      @preview = true
+    end
+  end
+
+  def destroy
+    @action.destroy
+    respond_to do |format|
+      format.html do
+        redirect_to actions_url, notice: "Mute deleted."
+      end
+      format.js do
+        @mutes = @user.actions.mute.natural_sort_by { |action| action.title }
+        flash[:notice] = "Mute deleted."
+        flash.discard
+      end
+    end
+  end
+
+  private
+
+  def set_action
+    @action = @user.actions.find(params[:id])
+  end
+end

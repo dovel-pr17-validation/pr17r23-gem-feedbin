@@ -1,0 +1,41 @@
+require "test_helper"
+
+class Admin::FeedsControllerTest < ActionController::TestCase
+  setup do
+    @user = users(:ben)
+    @feed = @user.feeds.first
+    @user.update!(admin: true) if @user.respond_to?(:admin=)
+  end
+
+  test "GET index requires admin" do
+    login_as users(:new)
+    get :index
+    assert_response :not_found
+  end
+
+  test "GET index renders without a query" do
+    login_as @user
+    get :index
+    assert_response :success
+  end
+
+  test "GET index with a non-numeric query takes the feed_url branch" do
+    login_as @user
+    get :index, params: {q: @feed.feed_url}
+    assert_response :success
+    assert_includes @response.body, ERB::Util.html_escape(@feed.title)
+  end
+
+  test "GET index with a numeric query takes the id branch" do
+    login_as @user
+    get :index, params: {q: @feed.id.to_s}
+    assert_response :success
+    assert_includes @response.body, ERB::Util.html_escape(@feed.title)
+  end
+
+  test "GET index survives a query that is not a scalar" do
+    login_as @user
+    get :index, params: {q: ["1"]}
+    assert_response :success
+  end
+end

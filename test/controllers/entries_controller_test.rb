@@ -1,0 +1,445 @@
+require "test_helper"
+require "minitest/stub_any_instance"
+
+class EntriesControllerTest < ActionController::TestCase
+  setup do
+    @user = users(:new)
+    @feeds = create_feeds(@user)
+    @entries = @user.entries
+  end
+
+  test "should get index" do
+    login_as @user
+    get :index, xhr: true
+    assert_response :success
+    assert_equal @entries.length, assigns(:entries).length
+  end
+
+  test "should get unread" do
+    mark_unread(@user)
+    @user.unread_entries.where(entry_id: @entries.first.id).delete_all
+    login_as @user
+    get :unread, xhr: true
+    assert_response :success
+    assert_equal assigns(:entries).length, @user.unread_entries.length
+  end
+
+  test "should get starred" do
+    starred_entry = StarredEntry.create_from_owners(@user, @entries.first)
+    login_as @user
+    get :starred, xhr: true
+    assert_response :success
+    assert_equal assigns(:entries).first, starred_entry.entry
+  end
+
+  test "should get show" do
+    login_as @user
+    get :show, params: {id: @entries.first}, xhr: true
+    assert_response :success
+  end
+
+  test "should get show with tweet" do
+    entry = create_tweet_entry(@user.feeds.first)
+    url = "https://extract.example.com/parser/user/4e4143c7bd4d8c935741d37a3c14f61a268a5b79?base64_url=aHR0cHM6Ly85dG81bWFjLmNvbS8yMDE4LzAxLzEyL2ZpbmFsLWN1dC1wcm8teC1ob3ctdG8taW1wcm92ZS1zbG93LW1vdGlvbi1pbi15b3VyLXByb2plY3RzLXZpZGVvLw=="
+    stub_request_file("parsed_page.json", url, headers: {"Content-Type" => "application/json; charset=utf-8"})
+    HarvestLinks.new.perform(entry.id)
+
+    login_as @user
+    get :show, params: {id: entry}, xhr: true
+    assert_response :success
+  end
+
+  test "should preload" do
+    login_as @user
+    get :preload, params: {ids: @entries.map(&:id).join(",")}, format: :json
+    data = JSON.parse(@response.body)
+    @entries.each do |entry|
+      assert data.key?(entry.id.to_s)
+    end
+  end
+
+  test "preload renders a settings button, not the settings menu" do
+    login_as @user
+    get :preload, params: {ids: @entries.map(&:id).join(",")}, format: :json
+    data = JSON.parse(@response.body)
+    @entries.each do |entry|
+      content = data[entry.id.to_s]["content"]
+      assert_includes content, "toggle_settings_menu"
+      refute_includes content, "menu-icon-subscriptions"
+    end
+  end
+
+  test "marks feed read" do
+    login_as @user
+    feed = @feeds.first
+    assert_difference("UnreadEntry.count", -feed.entries.length) do
+      post :mark_all_as_read, params: {type: "feed", data: feed.id}, xhr: true
+      assert_response :success
+    end
+  end
+
+  test "marks tag read" do
+    login_as @user
+    feed = @feeds.first
+    taggings = feed.tag(Faker::Name.name, @user)
+    feed_ids = taggings.map(&:feed_id)
+    feeds = Feed.where(id: feed_ids)
+    assert_difference("UnreadEntry.count", -feeds.entries.length) do
+      post :mark_all_as_read, params: {type: "tag", data: taggings.first.tag_id}, xhr: true
+      assert_response :success
+    end
+  end
+
+  test "marks starred read" do
+    login_as @user
+
+    starred_entries = @user.entries.limit(2).map { |entry|
+      StarredEntry.create_from_owners(@user, entry)
+    }
+
+    assert_difference("UnreadEntry.count", -starred_entries.length) do
+      post :mark_all_as_read, params: {type: "starred"}, xhr: true
+      assert_response :success
+    end
+  end
+
+  test "marks recently read" do
+    login_as @user
+
+    recently_read_entries = @user.entries.limit(2).map { |entry|
+      @user.recently_read_entries.create!(entry: entry)
+    }
+
+    assert_difference("UnreadEntry.count", -recently_read_entries.length) do
+      post :mark_all_as_read, params: {type: "recently_read"}, xhr: true
+      assert_response :success
+    end
+  end
+
+  test "marks updated read" do
+    login_as @user
+
+    updated_entries = @user.entries.limit(2).map { |entry|
+      @user.updated_entries.create!(entry: entry, feed: entry.feed)
+    }
+
+    assert_difference("UpdatedEntry.count", -updated_entries.length) do
+      post :mark_all_as_read, params: {type: "updated"}, xhr: true
+      assert_response :success
+    end
+  end
+
+  test "marks unread read" do
+    login_as @user
+    count = @user.unread_entries.count
+    assert_difference("UnreadEntry.count", -count) do
+      post :mark_all_as_read, params: {type: "unread"}, xhr: true
+      assert_response :success
+    end
+  end
+
+  test "marks all read" do
+    login_as @user
+    count = @user.unread_entries.count
+    assert_difference("UnreadEntry.count", -count) do
+      post :mark_all_as_read, params: {type: "all"}, xhr: true
+      assert_response :success
+    end
+  end
+
+  test "marks saved search read" do
+    original_per_page = WillPaginate.per_page
+    WillPaginate.per_page = 1
+
+    login_as @user
+
+    entries = @user.entries.first(2)
+
+    saved_search = @user.saved_searches.create(query: "\"#{entries.first.title}\" OR \"#{entries.last.title}\"", name: "test")
+    result = Entry.scoped_search({query: saved_search.query}, @user)
+    @entries = result.records(Entry).includes(:feed)
+    @page_query = result.pagination
+    @total_results = result.total
+
+
+    assert_difference("UnreadEntry.count", -result.pagination.total_entries) do
+      post :mark_all_as_read, params: {type: "saved_search", data: saved_search.id}, xhr: true
+      assert_response :success
+    end
+
+    mark_unread(@user)
+
+    assert_difference("UnreadEntry.count", -result.pagination.total_entries) do
+      post :mark_all_as_read, params: {type: "search", data: saved_search.query}, xhr: true
+      assert_response :success
+    end
+
+    WillPaginate.per_page = original_per_page
+  end
+
+  test "mark specific ids read" do
+    login_as @user
+    entries = @user.entries.first(2)
+    assert_difference("UnreadEntry.count", -entries.length) do
+      post :mark_all_as_read, params: {ids: entries.map(&:id).join(",")}, xhr: true
+      assert_response :success
+    end
+  end
+
+  test "mark read respects date cap" do
+    login_as @user
+    date = @user.unread_entries.order(created_at: :asc).limit(1).take.created_at.iso8601(6)
+    assert @user.unread_entries.count > 1
+    assert_difference("UnreadEntry.count", -1) do
+      post :mark_all_as_read, params: {type: "all", date: date}, xhr: true
+      assert_response :success
+    end
+  end
+
+  test "newsletter renders inline when NEWSLETTER_HOST is not set" do
+    entry = @user.entries.first
+    entry.update!(content: "<p>Newsletter body</p>")
+    with_env("NEWSLETTER_HOST" => nil) do
+      get :newsletter, params: {id: entry.public_id}
+    end
+    assert_response :success
+    assert_includes @response.body, "<p>Newsletter body</p>"
+  end
+
+  test "newsletter redirects to the stored page when NEWSLETTER_HOST is set" do
+    entry = @user.entries.first
+    with_env("NEWSLETTER_HOST" => "newsletters.example.com") do
+      get :newsletter, params: {id: entry.public_id}
+    end
+    assert_redirected_to "https://newsletters.example.com/#{entry.public_id[0..2]}/#{entry.public_id}.html"
+  end
+
+  test "pagination anchor is set to max entry id on first page" do
+    login_as @user
+    get :unread, xhr: true
+    assert_response :success
+    assert_equal Entry.maximum(:id), assigns(:anchor)
+  end
+
+  test "pagination anchor is preserved from params" do
+    login_as @user
+    anchor = Entry.maximum(:id) - 1
+    get :unread, params: {page_anchor: anchor}, xhr: true
+    assert_response :success
+    assert_equal anchor, assigns(:anchor)
+  end
+
+  test "pagination anchor excludes new entries from unread" do
+    mark_unread(@user)
+    login_as @user
+    anchor = Entry.maximum(:id)
+
+    new_entry = create_entry(@feeds.first)
+    UnreadEntry.create_from_owners(@user, new_entry)
+
+    get :unread, params: {page_anchor: anchor}, xhr: true
+    assert_response :success
+    refute_includes assigns(:entries).map(&:id), new_entry.id
+
+    get :unread, xhr: true
+    assert_response :success
+    assert_includes assigns(:entries).map(&:id), new_entry.id
+  end
+
+  test "pagination anchor excludes new entries with ASC sort" do
+    @user.update(entry_sort: "ASC")
+    mark_unread(@user)
+    login_as @user
+    anchor = Entry.maximum(:id)
+
+    new_entry = create_entry(@feeds.first)
+    UnreadEntry.create_from_owners(@user, new_entry)
+
+    get :unread, params: {page_anchor: anchor}, xhr: true
+    assert_response :success
+    refute_includes assigns(:entries).map(&:id), new_entry.id
+  end
+
+  test "unread pagination does not skip or dead-end when entries are read between pages" do
+    original_per_page = UnreadEntry.per_page
+    UnreadEntry.per_page = 5
+
+    feed = @feeds.first
+    10.times { create_entry(feed) }
+    mark_unread(@user)
+    @user.entries.order(:id).each_with_index do |entry, index|
+      entry.update_column(:published, Time.now - (100 - index).hours)
+      UnreadEntry.where(user: @user, entry_id: entry.id).update_all(published: entry.published)
+    end
+    expected_ids = @user.unread_entries.order("published DESC, entry_id DESC").pluck(:entry_id)
+
+    login_as @user
+
+    seen_ids = []
+    params = {}
+    10.times do
+      get :unread, params: params, xhr: true
+      assert_response :success
+      page_ids = assigns(:entries).map(&:id)
+      break if page_ids.empty?
+      seen_ids += page_ids
+
+      # simulate the user reading everything on this page before the next load
+      UnreadEntry.where(user: @user, entry_id: page_ids).delete_all
+
+      cursor = assigns(:page_cursor)
+      break if cursor.nil?
+      params = cursor.merge(page: 2, page_anchor: assigns(:anchor))
+    end
+
+    assert_equal expected_ids, seen_ids
+
+    UnreadEntry.per_page = original_per_page
+  end
+
+  test "unread pagination cursor is included in pager links" do
+    original_per_page = UnreadEntry.per_page
+    UnreadEntry.per_page = 2
+
+    mark_unread(@user)
+    login_as @user
+
+    get :unread, xhr: true
+    assert_response :success
+    assert_includes @response.body, "cursor_published"
+    assert_includes @response.body, "cursor_entry_id"
+
+    UnreadEntry.per_page = original_per_page
+  end
+
+  test "pagination anchor excludes new entries with view_all" do
+    login_as @user
+    original_count = @user.entries.count
+    anchor = Entry.maximum(:id)
+
+    create_entry(@feeds.first)
+
+    get :index, params: {view: "view_all", page_anchor: anchor}, xhr: true
+    assert_response :success
+    assert_equal original_count, assigns(:entries).length
+  end
+
+  # ---- mark_direction_as_read branches ---------------------------------------
+
+  test "mark_direction_as_read above clears unread entries above the boundary" do
+    login_as @user
+    mark_unread(@user)
+    ids = @user.unread_entries.pluck(:entry_id).take(2).map(&:to_s).join(",")
+
+    assert_difference -> { @user.unread_entries.count }, -2 do
+      post :mark_direction_as_read, params: {direction: "above", ids: ids}, xhr: true
+    end
+  end
+
+  test "mark_direction_as_read below for type=feed clears that feed's unread entries except listed ids" do
+    login_as @user
+    mark_unread(@user)
+    feed = @feeds.first
+    keep_id = feed.entries.first.id
+    expected = @user.unread_entries.where.not(feed_id: feed.id).pluck(:entry_id) + [keep_id]
+
+    post :mark_direction_as_read, params: {direction: "below", type: "feed", data: feed.id, ids: keep_id.to_s}, xhr: true
+    assert_response :success
+    assert_equal expected.sort, @user.unread_entries.pluck(:entry_id).sort
+  end
+
+  test "mark_direction_as_read below for type=tag clears the tagged feeds' unread entries except listed ids" do
+    login_as @user
+    mark_unread(@user)
+    feed = @feeds.first
+    tag = Tag.find_or_create_by(name: "T-#{SecureRandom.hex(2)}")
+    @user.taggings.create!(feed_id: feed.id, tag: tag)
+    keep_id = feed.entries.first.id
+    expected = @user.unread_entries.where.not(feed_id: feed.id).pluck(:entry_id) + [keep_id]
+
+    post :mark_direction_as_read, params: {direction: "below", type: "tag", data: tag.id, ids: keep_id.to_s}, xhr: true
+    assert_response :success
+    assert_equal expected.sort, @user.unread_entries.pluck(:entry_id).sort
+  end
+
+  test "mark_direction_as_read below for type=starred clears unreads in starred entries" do
+    login_as @user
+    mark_unread(@user)
+    kept, cleared = @user.entries.first(2)
+    [kept, cleared].each { @user.starred_entries.create!(entry_id: it.id, feed_id: it.feed_id) }
+    expected = @user.unread_entries.pluck(:entry_id) - [cleared.id]
+
+    post :mark_direction_as_read, params: {direction: "below", type: "starred", ids: kept.id.to_s}, xhr: true
+    assert_response :success
+    assert_equal expected.sort, @user.unread_entries.pluck(:entry_id).sort
+  end
+
+  test "mark_direction_as_read below for type=unread and type=all clears all unread entries except listed ids" do
+    login_as @user
+
+    %w[unread all].each do |type|
+      mark_unread(@user)
+      keep_id = @user.unread_entries.pluck(:entry_id).first
+
+      post :mark_direction_as_read, params: {direction: "below", type: type, ids: keep_id.to_s}, xhr: true
+      assert_response :success, type
+      assert_equal [keep_id], @user.unread_entries.pluck(:entry_id), type
+    end
+  end
+
+  test "mark_direction_as_read rejects a collection type it does not handle" do
+    login_as @user
+    mark_unread(@user)
+    keep_id = @user.unread_entries.pluck(:entry_id).first
+
+    assert_no_difference -> { @user.unread_entries.count } do
+      post :mark_direction_as_read, params: {direction: "below", type: "queued_entries", data: "", ids: keep_id.to_s}, xhr: true
+    end
+
+    assert_response :bad_request
+  end
+
+  test "mark_direction_as_read rejects a saved search that is not there" do
+    login_as @user
+    mark_unread(@user)
+    keep_id = @user.unread_entries.pluck(:entry_id).first
+
+    assert_no_difference -> { @user.unread_entries.count } do
+      post :mark_direction_as_read, params: {direction: "below", type: "saved_search", data: "0", ids: keep_id.to_s}, xhr: true
+    end
+
+    assert_response :bad_request
+  end
+
+  # ---- destroy ---------------------------------------------------------------
+
+  test "destroy enqueues EntryDeleter when the feed is a pages feed" do
+    login_as @user
+    feed = Feed.create!(feed_url: "https://pages.example/x", host: "pages.example", title: "P", feed_type: :pages)
+    @user.subscriptions.create!(feed: feed)
+    entry = feed.entries.create!(content: "<p>x</p>", title: "T", url: "/x", public_id: SecureRandom.hex)
+
+    deleted = []
+    EntryDeleter.stub_any_instance(:delete_entries, ->(*args) { deleted << args }) do
+      delete :destroy, params: {id: entry.id}, xhr: true
+    end
+    assert_response :success
+    assert_equal [[feed.id, entry.id]], deleted
+  end
+
+  # Relation#present? is records.blank? inverted -- it materializes the whole
+  # relation to answer. This is the path an account with tens of thousands of
+  # unread entries takes when it reaches for "mark all read".
+  test "marking all read with a date does not load the unread rows" do
+    login_as @user
+
+    statements = capture_sql do
+      post :mark_all_as_read, params: {type: "unread", date: 1.day.from_now.iso8601}, xhr: true
+    end
+
+    assert_response :success
+    loads = statements.select { _1.match?(/SELECT\s+"#{UnreadEntry.table_name}"\.\*/i) }
+    assert_empty loads, "the unread rows were materialized: #{loads.inspect}"
+  end
+
+end

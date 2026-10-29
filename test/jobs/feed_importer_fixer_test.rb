@@ -1,0 +1,67 @@
+require "test_helper"
+
+class FeedImportFixerTest < ActiveSupport::TestCase
+  setup do
+    @user = users(:new)
+    import = @user.imports.new
+    details = {
+      xml_url: "http://www.example.com/atom.xml",
+      tag: "Favorites",
+      title: "My Title"
+    }
+    @import_item = import.import_items.new(details: details)
+    import.save
+    @discovered_feed = DiscoveredFeed.create!(
+      site_url: @import_item.site_url,
+      feed_url: @import_item.feed_url
+    )
+
+    stub_request_file("atom.xml", @import_item.details[:xml_url])
+  end
+
+  test "should create subscription" do
+    assert_difference -> { Subscription.count }, +1 do
+      FeedImportFixer.new.perform(@user.id, @import_item.id, @discovered_feed.id)
+    end
+
+    assert_equal(@import_item.details[:title], Subscription.last.title)
+  end
+
+  test "should skip an item whose import was deleted" do
+    @import_item.import.destroy!
+    assert_no_difference -> { Subscription.count } do
+      FeedImportFixer.new.perform(@user.id, @import_item.id, @discovered_feed.id)
+    end
+  end
+
+  test "completes the item once the subscription exists" do
+    @import_item.update!(status: :fixable)
+
+    FeedImportFixer.new.perform(@user.id, @import_item.id, @discovered_feed.id)
+
+    assert @import_item.reload.complete?
+  end
+
+  # These items are the ones whose original url already failed to import. The
+  # discovered alternative is re-fetched an unknown amount of time later, so a
+  # 404 here is the ordinary case, not an exotic one.
+  test "leaves the item fixable when the replacement feed cannot be fetched" do
+    @import_item.update!(status: :fixable)
+    stub_request(:any, /example\.com/).to_return(status: 404)
+
+    assert_no_difference -> { Subscription.count } do
+      FeedImportFixer.new.perform(@user.id, @import_item.id, @discovered_feed.id)
+    end
+
+    assert @import_item.reload.fixable?
+  end
+
+  test "leaves the item fixable when there is no discovered feed" do
+    @import_item.update!(status: :fixable)
+    DiscoveredFeed.delete_all
+
+    FeedImportFixer.new.perform(@user.id, @import_item.id)
+
+    assert @import_item.reload.fixable?
+  end
+end

@@ -1,0 +1,58 @@
+require "test_helper"
+
+class Api::V2::UpdatedEntriesControllerTest < ApiControllerTestCase
+  setup do
+    @user = users(:new)
+    @feeds = create_feeds(@user)
+    @entries = @user.entries
+    @entries.map do |entry|
+      UpdatedEntry.new_from_owners(@user.id, entry).save
+    end
+  end
+
+  test "should get index" do
+    login_as @user
+    get :index, format: :json
+    assert_response :success
+    results = parse_json
+    assert_equal Set.new(@user.updated_entries.pluck(:entry_id)), Set.new(results)
+  end
+
+  test "should get updated_entry since specific time" do
+    login_as @user
+    last_entry = @user.updated_entries.order(updated_at: :desc).limit(1).take
+    since = last_entry.updated_at.iso8601(6)
+    last_entry.touch
+    get :index, params: {since: since}, format: :json
+    assert_response :success
+    results = parse_json
+    assert_equal Set.new([last_entry.entry_id]), Set.new(results)
+  end
+
+  test "should accept a minute-precision since" do
+    login_as @user
+    since = 10.years.ago.utc.strftime("%Y-%m-%dT%H:%MZ")
+
+    get :index, params: {since: since}, format: :json
+
+    assert_response :success
+    assert_equal Set.new(@user.updated_entries.pluck(:entry_id)), Set.new(parse_json)
+  end
+
+  test "should say which parameter is wrong when since cannot be parsed" do
+    login_as @user
+
+    get :index, params: {since: "yesterday"}, format: :json
+
+    assert_response :bad_request
+    assert parse_json["errors"].any? { |error| error.key?("since") }, parse_json.inspect
+  end
+
+  test "should destroy updated entry" do
+    login_as @user
+    assert_difference "UpdatedEntry.count", -@entries.length do
+      delete :destroy, params: {updated_entries: @entries.map(&:id)}, format: :json
+      assert_response :success
+    end
+  end
+end

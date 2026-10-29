@@ -1,0 +1,76 @@
+class ApiClient
+  class Error < StandardError
+  end
+
+  PAGE_SIZE = 100
+
+  def initialize(access_token)
+    @access_token = access_token
+  end
+
+  def feed_items_list(params:, limit: nil)
+    paged_feed_items(
+      path: "/api/v2/feed_items/list",
+      params: params,
+      limit: limit
+    )
+  end
+
+  def subscriptions_list
+    request(path: "/api/v2/subscriptions/list")
+  end
+
+  def streams_list
+    request(path: "/api/v2/streams/list")
+  end
+
+  private
+
+  def paged_feed_items(path:, params:, limit:)
+    params[:offset] = 0 if params[:offset].nil?
+    all = []
+    loop do
+      response = request(path: path, params: params)
+      result = response.safe_dig("feed_items") || []
+      break if result.count == 0
+      all += result
+      params[:offset] += PAGE_SIZE
+      # The offset only ever lands on a multiple of the page size, so an
+      # equality test here silently fetches the whole collection for any other
+      # limit.
+      break if !limit.nil? && params[:offset] >= limit
+    end
+    limit.nil? ? all : all.first(limit)
+  end
+
+  def request(path:, params: {})
+    url = URI::HTTPS.build({
+      host: ENV["ACCOUNT_HOST"],
+      path: path,
+      query: default_params.merge(params).to_query
+    })
+    response = HTTP
+      .timeout(write: 5, connect: 5, read: 30)
+      .follow(max_hops: 5)
+      .headers(user_agent: "Feedbin")
+      .get(url)
+
+    raise ApiClient::Error.new(response.status.reason) unless response.status.success?
+
+    result = response.parse
+    error_message = result.safe_dig("error")
+    status = result.safe_dig("result")
+
+    if !error_message.nil? || status == "error"
+      raise ApiClient::Error.new(error_message || "Unknown API error.")
+    end
+
+    result
+  rescue HTTP::Error => exception
+    raise ApiClient::Error.new("HTTP error: #{exception.message}")
+  end
+
+  def default_params
+    { access_token: @access_token }
+  end
+end

@@ -1,0 +1,16 @@
+# Read about fixtures at https://api.rubyonrails.org/classes/ActiveRecord/FixtureSet.html
+
+ben_newsletter:
+  user: ben
+  token: token
+  purpose: 2
+
+new_newsletter:
+  user: new
+  token: token_new
+  purpose: 2
+
+timed_newsletter:
+  user: timed
+  token: token_timed
+  purpose: 2

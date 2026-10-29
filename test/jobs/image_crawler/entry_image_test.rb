@@ -1,0 +1,138 @@
+require "test_helper"
+
+module ImageCrawler
+  class EntryImageTest < ActiveSupport::TestCase
+    setup do
+      flush_redis
+      @feed = Feed.first
+      @feed.update(host: "example.com")
+      @feed.reload
+      @entry = @feed.entries.create(
+        content: Faker::Lorem.paragraph,
+        public_id: SecureRandom.hex,
+        url: "http://example.com"
+      )
+    end
+
+    test "should enqueue Find" do
+      assert_difference -> { Pipeline::Find.jobs.size }, +1 do
+        EntryImage.new.perform(@entry.public_id)
+      end
+    end
+
+    test "should enqueue Find with parsed urls" do
+
+      content = <<-EOT
+      <video poster="/video">
+      <iframe src="/iframe"></iframe>
+      <meta property="og:image" content="/og">
+      <meta property="twitter:image" content="/twitter">
+      <img src="/img">
+      EOT
+
+      entry = Feed.first.entries.create(
+        content: content,
+        public_id: SecureRandom.hex,
+        url: "http://example.com"
+      )
+
+      EntryImage.new.perform(entry.public_id)
+
+      image = Image.new(Pipeline::Find.jobs.first["args"].first)
+      extracted_urls = image.image_urls
+      assert_equal ::Image.kinds[:poster], image.kind
+
+      # should come back in the order of ImageCrawler::EntryImage::IMAGE_SELECTORS
+      assert_equal "http://example.com/twitter", extracted_urls[0]
+      assert_equal "http://example.com/og",      extracted_urls[1]
+      assert_equal "http://example.com/img",     extracted_urls[2]
+      assert_equal "http://example.com/iframe",  extracted_urls[3]
+      assert_equal "http://example.com/video",   extracted_urls[4]
+
+      assert_equal(entry.public_id, image.id)
+      assert_equal(entry.fully_qualified_url, image.entry_url)
+    end
+
+    test "should enqueue Find with youtube url" do
+      @entry.update(data: {youtube_video_id: "youtube_video_id"})
+      @entry.reload
+      EntryImage.new.perform(@entry.public_id)
+
+      image = Image.new(Pipeline::Find.jobs.first["args"].first)
+      extracted_urls = image.image_urls
+      assert_equal([@entry.url], extracted_urls)
+      assert_equal ::Image.kinds[:poster], image.kind, "a video thumbnail stands for the item"
+    end
+
+    test "should enqueue Find with tweet url" do
+      entry = create_tweet_entry(Feed.first, "two")
+      EntryImage.new.perform(entry.public_id)
+      image = Image.new(Pipeline::Find.jobs.first["args"].first)
+      extracted_urls = image.image_urls
+      assert_equal(["https://pbs.twimg.com/media/EwDoQHMVIAAGbaP.jpg"], extracted_urls)
+    end
+
+    test "should enqueue Find with media url" do
+      xml = File.read(support_file("microposts.xml"))
+      parsed = Feedkit::Parser::XMLFeed.new(xml, "http://example.com")
+      feed = Feed.create_from_parsed_feed(parsed)
+      entry = feed.entries.last
+      EntryImage.new.perform(entry.public_id)
+      image = Image.new(Pipeline::Find.jobs.first["args"].first)
+      extracted_urls = image.image_urls
+      assert_equal(["https://cdn.masto.host/frontendsocial/media_attachments/files/109/480/363/100/027/057/original/94aa051201c933c6.png", "https://cdn.masto.host/frontendsocial/media_attachments/files/109/480/363/321/232/707/original/fd91baf5af1de4eb.png", "https://cdn.masto.host/frontendsocial/media_attachments/files/109/480/363/513/928/252/original/005201b20fde9798.png"], extracted_urls)
+    end
+
+    test "the callback touches the entry" do
+      original_updated_at = @entry.updated_at
+      EntryImage.new.perform(@entry.public_id, {"storage_path" => "abc/abcdef.jpg", "provider_id" => @entry.id.to_s})
+
+      @entry.reload
+      assert @entry.updated_at > original_updated_at, "the callback should touch the entry to bust cached views"
+    end
+
+    test "should skip enqueue when an images row exists" do
+      ::Image.create!(
+        provider: :entry_preview,
+        provider_id: @entry.id.to_s,
+        feed_id: @entry.feed_id,
+        url: "http://example.com/image.jpg",
+        variant: "542x304",
+        image_fingerprint: SecureRandom.hex(16),
+        original_fingerprint: SecureRandom.hex(16),
+        storage_path: ::Image.storage_path_for("http://example.com/image.jpg", "542x304"),
+        width: 542, height: 304, bytesize: 12_345,
+        placeholder_color: "aabbcc"
+      )
+
+      # processed_image? renders the row through the image host, which
+      # production always sets (Image.check_storage_config!).
+      with_env("UNIFIED_IMAGE_HOST" => "https://images.example.com") do
+        assert_no_difference -> { Pipeline::Find.jobs.size } do
+          EntryImage.new.perform(@entry.public_id)
+        end
+      end
+    end
+
+    test "should enqueue Find with feed context and meta urls" do
+      content = <<-EOT
+      <meta property="og:image" content="/og">
+      <img src="/img">
+      EOT
+
+      entry = @feed.entries.create(
+        content: content,
+        public_id: SecureRandom.hex,
+        url: "http://example.com/article"
+      )
+
+      EntryImage.new.perform(entry.public_id)
+
+      image = Image.new(Pipeline::Find.jobs.first["args"].first)
+      assert_equal @feed.id, image.feed_id
+      assert_equal entry.fully_qualified_url, image.page_url
+      assert_equal ["http://example.com/og"], image.meta_image_urls
+      assert_equal ["http://example.com/og", "http://example.com/img"], image.image_urls
+    end
+  end
+end

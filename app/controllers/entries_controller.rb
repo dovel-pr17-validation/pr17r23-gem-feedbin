@@ -1,0 +1,283 @@
+class EntriesController < ApplicationController
+  skip_before_action :verify_authenticity_token, only: [:push_view, :newsletter]
+  skip_before_action :authorize, only: [:push_view, :newsletter]
+
+  def index
+    @user = current_user
+
+    @feed_ids = @user.subscriptions.pluck(:feed_id)
+    feeds_response
+
+    @type = "all"
+    @data = nil
+
+    @collection_title = "All"
+
+    respond_to do |format|
+      format.js { render partial: "shared/entries" }
+    end
+  end
+
+  def unread
+    @user = current_user
+
+    @entries = entries_page(@user.unread_entries.select(:entry_id), sort: @user.entry_sort)
+
+    @append = params[:page].present?
+    @all_unread = "true"
+    @collection_title = "Unread"
+
+    respond_to do |format|
+      format.js { render partial: "shared/entries" }
+    end
+  end
+
+  def starred
+    @user = current_user
+
+    @entries = entries_page(@user.starred_entries.select(:entry_id))
+
+    @append = params[:page].present?
+    @collection_title = "Starred"
+
+    respond_to do |format|
+      format.js { render partial: "shared/entries" }
+    end
+  end
+
+  def show
+    @user = current_user
+    ids = @user.can_read_filter([params[:id].to_i])
+    if ids.present?
+      @entries = entries_by_id(ids)
+      UnreadEntry.where(user: @user, entry_id: params[:id]).delete_all
+      UpdatedEntry.where(user: @user, entry_id: params[:id]).delete_all
+      respond_to do |format|
+        format.js
+        format.html do
+          logged_in
+        end
+      end
+    else
+      render_404
+    end
+  end
+
+  def preload
+    @user = current_user
+    if params[:ids].respond_to?(:split)
+      ids = params[:ids].split(",").map { |i| i.to_i }
+      ids = @user.can_read_filter(ids)
+      ViewLinkCacheMultiple.perform_async(@user.id, ids)
+      entries = entries_by_id(ids)
+      render json: entries.to_json
+    else
+      head :ok
+    end
+  end
+
+  def mark_as_read
+    @user = current_user
+    UnreadEntry.where(user: @user, entry_id: params[:id]).delete_all
+    UpdatedEntry.where(user: @user, entry_id: params[:id]).delete_all
+    head :ok
+  end
+
+  def mark_all_as_read
+    @user = current_user
+
+    @full_update = true
+
+    if params[:type] == "feed"
+      unread_entries = UnreadEntry.where(user_id: @user.id, feed_id: params[:data])
+      @full_update = false
+    elsif params[:type] == "tag"
+      feed_ids = @user.taggings.where(tag_id: params[:data]).pluck(:feed_id)
+      unread_entries = UnreadEntry.where(user_id: @user.id, feed_id: feed_ids)
+      @full_update = false
+    elsif params[:type] == "starred"
+      starred = @user.starred_entries.pluck(:entry_id)
+      unread_entries = UnreadEntry.where(user_id: @user.id, entry_id: starred)
+    elsif params[:type] == "recently_read"
+      recently_read = @user.recently_read_entries.pluck(:entry_id)
+      unread_entries = UnreadEntry.where(user_id: @user.id, entry_id: recently_read)
+    elsif params[:type] == "updated"
+      updated = @user.updated_entries.pluck(:entry_id)
+      unread_entries = UnreadEntry.where(user_id: @user.id, entry_id: updated)
+      @user.updated_entries.delete_all
+    elsif %w[unread all].include?(params[:type])
+      unread_entries = UnreadEntry.where(user_id: @user.id)
+      @full_update = false
+    elsif params[:type] == "saved_search"
+      saved_search = @user.saved_searches.where(id: params[:data]).first
+      if saved_search.present?
+        params[:query] = saved_search.query
+        ids = matched_search_ids(params)
+        unread_entries = UnreadEntry.where(user_id: @user.id, entry_id: ids)
+      end
+    elsif params[:type] == "search"
+      params[:query] = params[:data]
+      ids = matched_search_ids(params)
+      unread_entries = UnreadEntry.where(user_id: @user.id, entry_id: ids)
+    end
+
+    # exists?, not present? -- Relation#present? is records.blank? inverted, so
+    # it loads every unread row the user has just to decide whether to add a
+    # WHERE clause, and this is the path the largest accounts take.
+    if params[:date].present? && unread_entries&.exists?
+      unread_entries = unread_entries.where("created_at <= :last_unread_date", {last_unread_date: params[:date]})
+    end
+
+    unread_entries&.delete_all
+
+    if params[:ids].present?
+      ids = params[:ids].split(",").map(&:to_i)
+      UnreadEntry.where(user_id: @user.id, entry_id: ids).delete_all
+    end
+
+    get_feeds_list if @full_update
+
+    respond_to do |format|
+      format.js
+    end
+  end
+
+  def mark_direction_as_read
+    @user = current_user
+    ids = params[:ids].split(",").map { |i| i.to_i }
+    if params[:direction] == "above"
+      unread_entries = UnreadEntry.where(user: @user, entry_id: ids)
+      if params[:type] == "updated"
+        @user.updated_entries.where(entry_id: ids).delete_all
+      end
+    else
+      if params[:type] == "feed"
+        unread_entries = UnreadEntry.where(user: @user, feed_id: params[:data]).where.not(entry_id: ids)
+      elsif params[:type] == "tag"
+        feed_ids = @user.taggings.where(tag_id: params[:data]).pluck(:feed_id)
+        unread_entries = UnreadEntry.where(user: @user, feed_id: feed_ids).where.not(entry_id: ids)
+      elsif params[:type] == "starred"
+        starred = @user.starred_entries.pluck(:entry_id)
+        unread_entries = UnreadEntry.where(user: @user, entry_id: starred).where.not(entry_id: ids)
+      elsif params[:type] == "updated"
+        updated = @user.updated_entries.pluck(:entry_id)
+        unread_entries = UnreadEntry.where(user: @user, entry_id: updated).where.not(entry_id: ids)
+        @user.updated_entries.where.not(entry_id: ids).delete_all
+      elsif %w[unread all].include?(params[:type])
+        unread_entries = UnreadEntry.where(user: @user).where.not(entry_id: ids)
+      elsif params[:type] == "saved_search"
+        saved_search = @user.saved_searches.where(id: params[:data]).first
+        if saved_search.present?
+          params[:query] = saved_search.query
+          search_ids = matched_search_ids(params)
+          ids = search_ids - ids
+          unread_entries = UnreadEntry.where(user_id: @user.id, entry_id: ids)
+        end
+      elsif params[:type] == "search"
+        params[:query] = params[:data]
+        search_ids = matched_search_ids(params)
+        ids = search_ids - ids
+        unread_entries = UnreadEntry.where(user_id: @user.id, entry_id: ids)
+      end
+    end
+
+    # The cascade above does not assign for every collection the UI can be
+    # showing — queued_entries and recently_read among them — nor when the
+    # saved search is gone. Say so rather than raising, and rather than
+    # quietly marking nothing.
+    return head :bad_request if unread_entries.nil?
+
+    unread_entries.delete_all
+
+    get_feeds_list
+
+    respond_to do |format|
+      format.js
+    end
+  end
+
+  def search
+    @user = current_user
+    @escaped_query = params[:query] if params[:query]
+    params[:query] = "#{params[:query]} #{params[:query_extra]}"
+
+    @saved_search = @user.saved_searches.build(query: params[:query])
+
+    @saved_search_path = new_saved_search_path(query: params[:query])
+    result = Entry.scoped_search(params, @user)
+    @entries = result.records(Entry).with_list_associations
+    @page_query = result.pagination
+    @total_results = result.total
+
+    @append = params[:page].present?
+
+    @type = "all"
+    @data = nil
+
+    @search = true
+
+    @search_message = "Mark #{helpers.number_with_delimiter(@total_results)} #{"article".pluralize(@total_results)} that #{"match".pluralize(@total_results == 1 ? 2 : 1)} the search “#{@escaped_query}” as read?"
+
+    @collection_title = "Search"
+
+    respond_to do |format|
+      format.js { render partial: "shared/entries" }
+    end
+  end
+
+  def push_view
+    user_id = verify_push_token(params[:user])
+    user = User.find(user_id)
+    entry = Entry.find(params[:id])
+    redirect_to entry_url(entry), status: :found
+  end
+
+  def newsletter
+    @entry = Entry.where(public_id: params[:id]).take!
+    if ENV["NEWSLETTER_HOST"]
+      redirect_to @entry.newsletter_url, allow_other_host: true
+    else
+      render layout: nil
+    end
+  end
+
+  def destroy
+    @user = current_user
+    @entry = @user.entries.find(params[:id])
+    if @entry.feed.pages?
+      EntryDeleter.new.delete_entries(@entry.feed_id, @entry.id)
+    end
+  end
+
+  private
+
+  def entries_by_id(entry_ids)
+    # The full-content render reaches the images rows too: a tweet through
+    # Entry#tweet (preview_image_record), a podcast through
+    # EntryPresenter#media_image (icon_image_record), both read from
+    # owned_image_records. The preload endpoint renders a client-sized batch
+    # of these at once.
+    entries = Entry.where(id: entry_ids).includes(feed: Feed::ICON_PRELOADS)
+      .preload(:owned_image_records)
+    subscriptions = @user.subscriptions.pluck(:feed_id)
+    @title = entries.present? ? "#{entries.first.title} - Feedbin" : "Feedbin"
+    entries.each_with_object({}) do |entry, hash|
+      locals = {
+        entry: entry,
+        extract: false,
+        user: @user,
+        subscriptions: subscriptions
+      }
+      hash[entry.id] = {
+        content: render_to_string(partial: "entries/show", formats: [:html], locals: locals),
+        inner_content: render_to_string(partial: "entries/inner_content", formats: [:html], locals: locals),
+        feed_id: entry.feed_id
+      }
+    end
+  end
+
+  def matched_search_ids(params)
+    query = Entry.build_query(user: @user, query: params[:query])
+    Search.client { it.all_matches(Search.index_name(Entry.table_name), query: query) }
+  end
+end

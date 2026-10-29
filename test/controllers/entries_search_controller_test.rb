@@ -1,0 +1,133 @@
+require "test_helper"
+
+class EntriesSearchControllerTest < ActionController::TestCase
+  tests EntriesController  # explicitly declare controller
+
+  setup do
+    @user = users(:ben)
+    @entry = create_entry(@user.feeds.first)
+  end
+
+  test "should get search" do
+    login_as @user
+    # A unique token: search index contents survive across tests in a run, so
+    # a Faker sentence can collide with a stale document from another test.
+    @entry.update!(title: "searchtoken #{SecureRandom.hex}")
+    reindex_search
+    get :search, params: {query: "\"#{@entry.title}\""}, xhr: true
+    assert_response :success
+    assert_equal 1, assigns(:page_query).total_entries
+  end
+
+  # The search path builds @entries off the search result, not
+  # entries_list, so it needs its own preload of the images rows the list
+  # renders: the feed's favicon and the entry's preview image. Counts
+  # queries (.loaded? cannot tell a preload from an early N+1) and compares
+  # two distinct-feed sizes rather than a fixed number, spread across feeds
+  # so a shared instance's association cache cannot hide a missing preload.
+  test "search results preload the images rows the entry list renders" do
+    login_as @user
+    token = "previewimagepreloadtoken"
+
+    few_feeds = 2.times.map { |index|
+      feed = Feed.create!(feed_url: "http://previewfew#{index}.example.com/feed.xml", host: "previewfew#{index}.example.com", title: "Preview Few #{index}")
+      @user.subscriptions.create!(feed: feed)
+      feed
+    }
+    few_entries = few_feeds.map { |feed| create_entry(feed).tap { |entry| entry.update!(title: "#{token} #{SecureRandom.hex}") } }
+    few_entries.each { Search::SearchIndexStore.new.perform("Entry", it.id) }
+    Search.client { it.refresh }
+
+    with_few_feeds = capture_sql { get :search, params: {query: token}, xhr: true }
+
+    many_feeds = 6.times.map { |index|
+      feed = Feed.create!(feed_url: "http://previewmany#{index}.example.com/feed.xml", host: "previewmany#{index}.example.com", title: "Preview Many #{index}")
+      @user.subscriptions.create!(feed: feed)
+      feed
+    }
+    many_entries = many_feeds.map { |feed| create_entry(feed).tap { |entry| entry.update!(title: "#{token} #{SecureRandom.hex}") } }
+    many_entries.each { Search::SearchIndexStore.new.perform("Entry", it.id) }
+    Search.client { it.refresh }
+
+    with_many_feeds = capture_sql { get :search, params: {query: token}, xhr: true }
+
+    assert_response :success
+    assert_operator assigns(:entries).to_a.size, :>=, 8
+    pattern = /FROM "images"/i
+    few = with_few_feeds.count { it.match?(pattern) }
+    many = with_many_feeds.count { it.match?(pattern) }
+    assert_equal few, many, "the images lookup scales with the number of distinct feeds: #{few} then #{many}"
+  end
+
+  test "should handle complex query with multiple conditions" do
+    @entry.update!(title: "Cat Story", content: "About cats", published: Date.parse("2023-06-15"))
+    reindex_search
+    login_as @user
+    get :search, params: {query: "cats is:unread sort:desc published:>2023-01-01"}, xhr: true
+    assert_response :success
+    assert_equal(@entry, assigns(:entries).first)
+  end
+
+  test "should handle query with boolean operators and ranges" do
+    @entry.update!(title: "", content: "")
+    reindex_search
+    @user.starred_entries.create!(entry: @entry)
+    login_as @user
+    get :search, params: {query: "dogs OR is:starred"}, xhr: true
+    assert_response :success
+    assert_equal(@entry, assigns(:entries).first)
+  end
+
+  test "should handle query with tag groups" do
+    @entry.update!(title: "Tagged Story", content: "Content", updated: Date.parse("2023-08-15"))
+    reindex_search
+
+    tag = Tag.create!(name: "Tag")
+    @user.taggings.create!(tag: tag, feed: @entry.feed)
+
+    login_as @user
+    get :search, params: {query: "tagged tag_id:#{tag.id} word_count:[1 TO 2]"}, xhr: true
+    assert_response :success
+    assert_equal(@entry, assigns(:entries).first)
+  end
+
+  test "should handle query with date ranges" do
+    @entry.update!(title: "Tagged Story", content: "Content", updated_at: Date.parse("2023-08-15"), published: Date.parse("2023-08-15"))
+    reindex_search
+
+    tag = Tag.create!(name: "Tag")
+    @user.taggings.create!(tag: tag, feed: @entry.feed)
+
+    login_as @user
+    get :search, params: {query: "updated:[2023-06-01 TO 2023-12-31]"}, xhr: true
+    assert_response :success
+    assert_equal(@entry, assigns(:entries).first)
+
+    get :search, params: {query: "published:[2023-06-01 TO 2023-12-31]"}, xhr: true
+    assert_equal(@entry, assigns(:entries).first)
+  end
+
+  test "should handle exact title search" do
+    @entry.update!(title: "Exact Title Search", content: "Exact Content Search", author: nil)
+    reindex_search
+    login_as @user
+    get :search, params: {query: "title_exact:\"Exact Title Search\""}, xhr: true
+    assert_equal(@entry, assigns(:entries).first)
+
+    get :search, params: {query: "content.exact:\"Exact Content Search\""}, xhr: true
+    assert_equal(@entry, assigns(:entries).first)
+
+    get :search, params: {query: "body:\"Exact Content Search\""}, xhr: true
+    assert_equal(@entry, assigns(:entries).first)
+
+    get :search, params: {query: "_missing_:author"}, xhr: true
+    assert_equal(@entry, assigns(:entries).first)
+  end
+
+  private
+
+  def reindex_search
+    Search::SearchIndexStore.new.perform("Entry", @entry.id)
+    Search.client { it.refresh }
+  end
+end

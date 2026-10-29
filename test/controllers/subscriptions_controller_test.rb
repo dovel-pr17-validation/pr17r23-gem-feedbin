@@ -1,0 +1,107 @@
+require "test_helper"
+
+class SubscriptionsControllerTest < ActionController::TestCase
+  setup do
+    @user = users(:ben)
+  end
+
+  test "should get index" do
+    login_as @user
+    get :index, format: :xml
+    assert_response :success
+  end
+
+  test "should export each feed once" do
+    tagged = feeds(:daring_fireball)
+    untagged = feeds(:kottke)
+    @user.subscriptions.create!(feed: untagged)
+    tagged.tag("Design", @user)
+
+    login_as @user
+    get :index, format: :xml
+    assert_response :success
+
+    outlines = Nokogiri::XML(@response.body).css("outline[xmlUrl]")
+    assert_equal [tagged.feed_url, untagged.feed_url].sort, outlines.map { it["xmlUrl"] }.sort
+    assert_equal [tagged.feed_url], outlines.select { it.parent["text"] == "Design" }.map { it["xmlUrl"] }
+  end
+
+  test "should export a tag the user has" do
+    tag = @user.feeds.first.tag("Design", @user).first.tag
+    login_as @user
+    get :index, params: {tag: tag.id}, format: :xml
+    assert_response :success
+    assert_includes @response.body, tag.name
+  end
+
+  test "should not export a tag the user has no tagging for" do
+    tag = feeds(:kottke).tag("Ann Private Tag", users(:ann)).first.tag
+    refute_includes @user.feed_tags.map(&:id), tag.id
+
+    login_as @user
+    get :index, params: {tag: tag.id}, format: :xml
+    assert_response :not_found
+    refute_includes @response.body, tag.name
+  end
+
+  test "should create subscription" do
+    html_url = "www.example.com/index.html"
+    feed_url = "http://www.example.com/atom.xml"
+    stub_request_file("index.html", html_url)
+    stub_request_file("atom.xml", feed_url)
+
+    feed = Feed.create(feed_url: feed_url)
+
+    valid_feed_ids = Rails.application.message_verifier(:valid_feed_ids).generate([feed.id])
+
+    params = {
+      valid_feed_ids: valid_feed_ids,
+      feeds: {
+        feed.id => {
+          title: "title",
+          tags: "Design",
+          subscribe: "1",
+          media_only: "1"
+        }
+      }
+    }
+    login_as @user
+    assert_difference "Subscription.count", +1 do
+      post :create, params: params, xhr: true
+      assert_response :success
+    end
+
+    subscription = @user.subscriptions.where(feed: feed).take!
+    assert(subscription.media_only, "Subscription should be media only")
+  end
+
+  test "should not report a rename the model rejected" do
+    login_as @user
+    feed = Feed.create(feed_url: SecureRandom.hex, site_url: SecureRandom.hex, title: "Pages")
+    subscription = @user.subscriptions.create!(feed: feed, kind: :generated, title: "Pages")
+
+    patch :update, params: {id: subscription.id, subscription: {title: "Renamed"}}, xhr: true
+
+    assert_equal "Pages", subscription.reload.title
+    assert_not_includes @response.body, "Renamed"
+  end
+
+  test "edit 404s for a feed the user is not subscribed to" do
+    login_as @user
+    feed = feeds(:kottke)
+    assert_nil @user.subscriptions.find_by_feed_id(feed.id)
+
+    assert_raises(ActiveRecord::RecordNotFound) do
+      get :edit, params: {id: feed.id}, xhr: true
+    end
+  end
+
+  test "should destroy subscription" do
+    login_as @user
+    subscription = @user.subscriptions.first
+    assert_difference "Subscription.count", -1 do
+      delete :destroy, params: {id: subscription}, xhr: true
+      assert_response :success
+    end
+  end
+end

@@ -1,0 +1,260 @@
+require "test_helper"
+
+class SupportedSharingServicesControllerTest < ActionController::TestCase
+  setup do
+    @user = users(:ben)
+    @service = @user.supported_sharing_services.create(service_id: "kindle")
+  end
+
+  test "should create supported sharing service" do
+    login_as @user
+    assert_difference "SupportedSharingService.count", +1 do
+      post :create, params: {supported_sharing_service: {service_id: "email"}}
+      assert_redirected_to sharing_services_url
+    end
+  end
+
+  test "should destroy supported sharing service" do
+    login_as @user
+    assert_difference "SupportedSharingService.count", -1 do
+      delete :destroy, params: {id: @service}
+      assert_redirected_to sharing_services_url
+    end
+  end
+
+  test "should update supported sharing service" do
+    login_as @user
+    attributes = {email_name: "email_name", email_address: "email_address", kindle_address: "kindle_address"}
+    patch :update, params: {id: @service, supported_sharing_service: attributes}
+    assert_redirected_to sharing_services_url
+    attributes.each do |attribute, value|
+      assert_equal(value, @service.reload.send(attribute))
+    end
+  end
+
+  test "should get completions" do
+    options = ["test@test.com", "test@example.com"]
+    @service.update(service_options: {completions: options})
+    login_as @user
+    get :autocomplete, params: {id: @service, query: "test"}
+    assert_response :success
+    data = JSON.parse(@response.body)
+    assert_equal options, data["suggestions"].map { it["value"] }
+
+    get :autocomplete, params: {id: @service, query: "EXAMPLE"}
+    assert_equal ["test@example.com"], JSON.parse(@response.body)["suggestions"].map { it["value"] }
+  end
+
+  test "should authorize with oauth" do
+    code = "code"
+    token = "access_token"
+
+    stub_request(:post, Share::Pocket.new.url_for(:oauth_request).to_s)
+      .to_return(body: {code: code}.to_json, status: 200)
+
+    login_as @user
+    post :create, params: {supported_sharing_service: {service_id: "pocket", operation: "authorize"}}
+    assert_redirected_to Share::Pocket.new.authorize_url(code)
+
+    stub_request(:post, Share::Pocket.new.url_for(:oauth_authorize).to_s)
+      .with(body: hash_including({"code" => code}))
+      .to_return(body: {access_token: token}.to_json, status: 200)
+
+    assert_difference "SupportedSharingService.count", +1 do
+      get :oauth_response, params: {id: "pocket"}
+      assert_redirected_to sharing_services_url
+    end
+
+    pocket = @user.supported_sharing_services.where(service_id: "pocket").take
+    assert_equal token, pocket.settings["access_token"]
+  end
+
+  test "should authorize with oauth2" do
+    code = "code"
+    token = "access_token"
+    service_id = "mastodon"
+    mastodon_host = "example.social"
+    client_id = "client_id"
+    client_secret = "client_secret"
+    access_token = "access_token"
+    redirect = Rails.application.routes.url_helpers.oauth2_response_supported_sharing_service_url(service_id, host: ENV["PUSH_URL"], mastodon_host: mastodon_host)
+
+    server_response = {
+      id:            "1",
+      website:       ENV["PUSH_URL"],
+      client_id:     client_id,
+      client_secret: client_secret,
+      redirect_uri:  redirect,
+    }
+
+    token_response = {
+      token_type:    "Bearer",
+      scope:         "write:statuses",
+      created_at:    Time.now.utc.to_i,
+      access_token:  access_token,
+      refresh_token: nil,
+      expires_at:    nil
+    }
+
+    login_as @user
+
+    stub_request(:post, "https://#{mastodon_host}/api/v1/apps")
+      .with(body: {
+        client_name:   "Feedbin",
+        redirect_uris: redirect,
+        scopes:        "write:statuses",
+        website:       ENV["PUSH_URL"]
+      })
+      .to_return(status: 200, body: server_response.to_json, headers: {content_type: "application/json"})
+
+    assert_difference -> { OauthServer.count }, +1 do
+      post :create, params: {mastodon_url: mastodon_host, supported_sharing_service: {service_id: service_id, operation: "authorize"}}
+      assert_response :redirect
+      assert_match %r{^https://#{mastodon_host}/oauth/authorize}, @response.redirect_url
+    end
+
+    stub_request(:post, "https://#{mastodon_host}/oauth/token")
+      .with(body: {
+        client_id:     client_id,
+        client_secret: client_secret,
+        code:          code,
+        redirect_uri:  redirect,
+        grant_type:    "authorization_code",
+        scope:         "write:statuses"
+      })
+      .to_return(status: 200, body: token_response.to_json, headers: {content_type: "application/json"})
+
+    state = session[:oauth2_state]
+    assert state.present?, "authorize should have issued a state nonce"
+    assert_match %r{state=#{state}}, CGI.unescape(@response.redirect_url)
+
+    assert_difference -> { SupportedSharingService.count }, +1 do
+      get :oauth2_response, params: {id: service_id, code: code, state: state, mastodon_host: mastodon_host}
+      assert_redirected_to sharing_services_url
+    end
+
+    share_data = {
+      status: "status",
+      spoiler_text: "spoiler_text",
+      visibility: "public"
+    }
+
+    stub_request(:post, "https://#{mastodon_host}/api/v1/statuses")
+      .with(
+        body: JSON.dump(share_data),
+        headers: {
+          "Authorization" => "Bearer #{access_token}",
+        })
+        .to_return(status: 200)
+
+    entry = create_entry(feeds(:daring_fireball))
+    share = SupportedSharingService.last
+    post :share, params: {id: share, entry_id: entry.id}.merge(share_data), xhr: true
+    assert_response :success
+  end
+
+  test "mastodon callback handles a private server" do
+    login_as @user
+    session[:oauth2_state] = "state"
+    OauthServer.create!(host: "127.0.0.1", data: {"client_id" => "id", "client_secret" => "secret"})
+
+    get :oauth2_response, params: {id: "mastodon", code: "code", state: "state", mastodon_host: "127.0.0.1"}
+
+    assert_redirected_to sharing_services_url
+    assert_match(/Could not connect to the Mastodon server/, flash[:alert])
+  end
+
+  test "should authorize instapaper with oauth2 and share with the bearer token" do
+    access_token = "instapaper_token"
+
+    login_as @user
+
+    with_env("INSTAPAPER_KEY" => "the-key", "INSTAPAPER_SECRET" => "the-secret") do
+      post :create, params: {supported_sharing_service: {service_id: "instapaper", operation: "authorize"}}
+
+      state = session[:oauth2_state]
+      assert state.present?, "authorize should have issued a state nonce"
+      assert_match %r{\Ahttps://www\.instapaper\.com/oauth2/authorize\?}, @response.redirect_url
+      assert_match %r{state=#{state}}, CGI.unescape(@response.redirect_url)
+
+      stub_request(:post, "https://www.instapaper.com/oauth2/token")
+        .to_return(
+          status: 200,
+          headers: {content_type: "application/json"},
+          body: {token_type: "Bearer", access_token: access_token, user: {id: 42, username: "reader@example.com"}}.to_json
+        )
+
+      assert_difference -> { SupportedSharingService.count }, +1 do
+        get :oauth2_response, params: {id: "instapaper", code: "code", state: state}
+        assert_redirected_to sharing_services_url
+      end
+    end
+
+    share = @user.supported_sharing_services.find_by(service_id: "instapaper")
+    assert_equal access_token, share.access_token
+    assert share.ok?
+
+    entry = create_entry(feeds(:daring_fireball))
+    bookmark = stub_request(:post, "https://www.instapaper.com/api/2/bookmarks")
+      .with(headers: {"Authorization" => "Bearer #{access_token}"}, body: hash_including("url" => entry.fully_qualified_url))
+      .to_return(status: 200, headers: {content_type: "application/json"}, body: {id: 1}.to_json)
+
+    post :share, params: {id: share, entry_id: entry.id}, xhr: true
+    assert_response :success
+    assert_requested bookmark
+  end
+
+  test "should tell the user when the oauth2 code exchange is rejected" do
+    login_as @user
+
+    with_env("INSTAPAPER_KEY" => "the-key", "INSTAPAPER_SECRET" => "the-secret") do
+      post :create, params: {supported_sharing_service: {service_id: "instapaper", operation: "authorize"}}
+      state = session[:oauth2_state]
+
+      stub_request(:post, "https://www.instapaper.com/oauth2/token")
+        .to_return(
+          status: 400,
+          headers: {content_type: "application/json"},
+          body: {error: "invalid_grant", error_description: "The authorization code is invalid, expired, or already used."}.to_json
+        )
+
+      assert_no_difference -> { SupportedSharingService.count } do
+        get :oauth2_response, params: {id: "instapaper", code: "stale", state: state}
+      end
+    end
+
+    assert_redirected_to sharing_services_url
+    assert flash[:alert].present?, "the user should be told the sign-in failed"
+  end
+
+  test "should share" do
+    Sidekiq::Worker.clear_all
+    entry = create_entry(feeds(:daring_fireball))
+    @service.update(kindle_address: "example@example.com")
+    login_as @user
+    assert_difference "MakeEpub.jobs.size", +1 do
+      post :share, params: {id: @service, entry_id: entry.id}, xhr: true
+      assert_response :success
+    end
+  end
+
+  test "should not share an entry the user cannot read" do
+    Sidekiq::Worker.clear_all
+    entry = create_entry(feeds(:kottke))
+    refute @user.can_read_entry?(entry.id), "precondition: ben cannot read this entry"
+    @service.update(kindle_address: "attacker@kindle.example")
+    login_as @user
+    assert_no_difference "MakeEpub.jobs.size" do
+      post :share, params: {id: @service, entry_id: entry.id}, xhr: true
+    end
+    assert_response :not_found
+  end
+
+  test "should not complete an oauth2 link without the state it issued" do
+    login_as @user
+    assert_no_difference "SupportedSharingService.count" do
+      get :oauth2_response, params: {id: "mastodon", code: "attacker_code", mastodon_host: "attacker.example"}
+    end
+    assert_redirected_to sharing_services_url
+  end
+end

@@ -1,0 +1,739 @@
+class User < ApplicationRecord
+  attr_accessor :stripe_token, :old_password_valid, :update_auth_token,
+    :password_reset, :coupon_code, :is_trialing, :coupon_valid, :deleted
+
+  has_secure_password reset_token: false
+
+  store_accessor :settings,
+    :entry_sort,
+    :previous_read_count,
+    :starred_feed_enabled,
+    :precache_images,
+    :show_unread_count,
+    :sticky_view_inline,
+    :mark_as_read_confirmation,
+    :font_size,
+    :font,
+    :entry_width,
+    :apple_push_notification_device_token,
+    :mark_as_read_push_view,
+    :keep_unread_entries,
+    :receipt_info,
+    :theme,
+    :entries_display,
+    :entries_feed,
+    :entries_time,
+    :entries_body,
+    :entries_image,
+    :ui_typeface,
+    :update_message_seen,
+    :hide_recently_read,
+    :hide_updated,
+    :hide_airshow,
+    :view_mode,
+    :disable_image_proxy,
+    :api_client,
+    :marketing_unsubscribe,
+    :hide_recently_played,
+    :now_playing_entry,
+    :audio_panel_size,
+    :view_links_in_app,
+    :twitter_access_secret,
+    :twitter_access_token,
+    :twitter_screen_name,
+    :twitter_access_error,
+    :nice_frames,
+    :favicon_colors,
+    :newsletter_tag,
+    :feeds_width,
+    :entries_width,
+    :billing_issue,
+    :podcast_sort_order,
+    :podcast_download_limit,
+    :playlist_migration,
+    :fix_feeds_available,
+    :addresses_available,
+    :floaty,
+    :feed_search,
+    :password_resettable,
+    :needs_onboarding
+
+  has_one :coupon
+  has_many :subscriptions, dependent: :delete_all
+  has_many :podcast_subscriptions, dependent: :delete_all
+  has_many :feeds, through: :subscriptions
+  has_many :entries, through: :feeds
+  has_many :imports, dependent: :destroy
+  has_many :import_items, through: :imports
+  has_many :billing_events, as: :billable, dependent: :delete_all
+  has_many :taggings, dependent: :delete_all
+  has_many :tags, through: :taggings
+  has_many :sharing_services, dependent: :delete_all
+  has_many :supported_sharing_services, dependent: :delete_all
+  has_many :unread_entries, dependent: :delete_all
+  has_many :starred_entries, dependent: :delete_all
+  has_many :saved_searches, dependent: :delete_all
+  has_many :actions, dependent: :destroy
+  has_many :recently_read_entries, dependent: :delete_all
+  has_many :recently_played_entries, dependent: :delete_all
+  has_many :queued_entries, dependent: :delete_all
+  has_many :playlists, dependent: :delete_all
+  has_many :updated_entries, dependent: :delete_all
+  has_many :devices, dependent: :delete_all
+  has_many :authentication_tokens, dependent: :delete_all
+  has_many :account_migrations, dependent: :delete_all
+  has_many :in_app_purchases
+  has_many :app_store_notifications
+  belongs_to :plan
+
+  accepts_nested_attributes_for :sharing_services,
+    allow_destroy: true,
+    reject_if: ->(attributes) { attributes["label"].blank? || attributes["url"].blank? }
+
+  after_initialize :set_defaults, if: :new_record?
+
+  before_save :strip_email
+  before_save :activate_subscriptions
+  before_save { reset_auth_token }
+
+  after_create :schedule_trial_jobs
+
+  before_create :create_customer, unless: -> { !ENV["STRIPE_API_KEY"] }
+  before_create { generate_tokens }
+
+  before_update :update_billing, unless: -> { !ENV["STRIPE_API_KEY"] }
+  before_destroy :cancel_billing, unless: -> { !ENV["STRIPE_API_KEY"] }
+  before_destroy :create_deleted_user
+  before_destroy :record_stats
+
+  # `dependent: :delete_all` on starred, played and queued entries skips the
+  # counter caches those rows maintain on `entries`, so a destroy leaves the
+  # counts too high and EntryDeleter#prune_entries never frees the entries.
+  #
+  # prepend: true is required -- each `dependent:` association registers its
+  # own before_destroy when it is declared, all of them above this line, so
+  # without it the rows are already gone by the time this runs.
+  before_destroy :capture_counter_cache_targets, prepend: true
+  after_commit :repair_entry_counter_caches, on: :destroy
+
+  # How many distinct entry ids a destroy will carry before it stops
+  # collecting them and repairs whole feeds instead.
+  #
+  # Exact ids are far cheaper for an ordinary account: one that starred fifty
+  # things touches fifty entries, where its feeds hold thousands. They stop
+  # paying for themselves at the top end, where the list grows without bound
+  # -- and an account holding that many rows has starred a large share of its
+  # feeds anyway, so whole-feed repair costs about the same. 100,000 ids is
+  # roughly 800KB held here and 50 jobs of about 22KB each.
+  COUNTER_CACHE_ID_LIMIT = 100_000
+
+  def self.counter_cache_id_limit
+    COUNTER_CACHE_ID_LIMIT
+  end
+
+  validate :changed_password, on: :update, unless: ->(user) { user.password_reset }
+  validate :coupon_code_valid, on: :create, if: ->(user) { user.coupon_code }
+  validate :plan_type_valid, on: :update
+  validate :trial_plan_valid
+
+  validates_presence_of :email
+  validates_uniqueness_of :email, case_sensitive: false
+  validates_presence_of :password, on: :create
+
+  # Email is case-insensitive for identity here — index_users_on_lower_email
+  # enforces it — so every lookup has to fold both sides. This overrides the
+  # dynamic finder of the same name, which compares exactly.
+  def self.find_by_email(email)
+    email = normalize_email(email)
+    return nil if email.nil?
+    where("lower(email) = ?", email).take
+  end
+
+  # Base64-decoded HTTP Basic usernames arrive as arbitrary bytes. Postgres
+  # rejects a text parameter that is not valid UTF-8 before the query runs,
+  # and no stored address can hold those bytes anyway.
+  def self.normalize_email(email)
+    return nil unless email.is_a?(String)
+    bytes = (email.encoding == Encoding::UTF_8) ? email : email.dup.force_encoding(Encoding::UTF_8)
+    return nil unless bytes.valid_encoding?
+    bytes.strip.downcase
+  end
+
+  def newsletter_senders
+    NewsletterSender.where(token: newsletter_authentication_token.token).order(name: :asc)
+  end
+
+  def generate_tokens
+    generate_token(:starred_token)
+    generate_token(:inbound_email_token, 4)
+    generate_token(:page_token)
+    authentication_tokens.newsletters.new(length: 4)
+    authentication_tokens.app.new
+  end
+
+  def theme
+    preference = if settings
+      if settings["theme"] == "night"
+        "dusk"
+      else
+        settings["theme"]
+      end
+    end
+    preference.present? ? preference : "day"
+  end
+
+  def set_defaults
+    self.expires_at = Feedbin::Application.config.trial_days.days.from_now
+    self.update_auth_token = true
+    self.mark_as_read_confirmation = 1
+    self.font = "default"
+    self.font_size = 5
+    self.price_tier = Feedbin::Application.config.price_tier
+    self.needs_onboarding = "1"
+  end
+
+  def with_params(params)
+    if params[:coupon_code].present?
+      coupon = Coupon.find_by(coupon_code: params[:coupon_code])
+      self.coupon_valid = coupon.present? && !coupon.redeemed
+      self.coupon_code = params[:coupon_code]
+    end
+
+    if coupon_valid || !ENV["STRIPE_API_KEY"]
+      self.free_ok = true
+      self.plan = Plan.find_by_stripe_id("free")
+    else
+      self.plan = Plan.find_by_stripe_id("trial")
+    end
+
+    if params[:user] && params[:user][:password]
+      self.password_confirmation = params[:user][:password]
+    end
+    self
+  end
+
+  def schedule_trial_jobs
+    TrialSendExpiration.perform_in(Feedbin::Application.config.trial_days.days - 1.days, id)
+  end
+
+  def setting_on?(setting_symbol)
+    send(setting_symbol) == "1"
+  end
+
+  def setting_on!(setting_symbol)
+    update(setting_symbol => "1")
+  end
+
+  def setting_off!(setting_symbol)
+    update(setting_symbol => "0")
+  end
+
+  def activate_subscriptions
+    if paid_conversion?
+      subscriptions.update_all(active: true)
+    end
+  end
+
+  def paid_conversion?
+    plan_id_changed? && plan_id_was == Plan.find_by_stripe_id("trial").id
+  end
+
+  def strip_email
+    email.strip!
+  end
+
+  def feed_tags
+    @feed_tags ||= begin
+      Tag.where(id: taggings.distinct.pluck(:tag_id)).natural_sort_by do |tag|
+        tag.name
+      end
+    end
+  end
+
+  def tag_names
+    feed_tags.each_with_object({}) do |tag, hash|
+      hash[tag.id] = tag.name
+    end
+  end
+
+  def coupon_code_valid
+    coupon_record = Coupon.find_by_coupon_code(coupon_code)
+    if !coupon_record || coupon_record.redeemed
+      errors.add(:coupon_code, "is invalid")
+    end
+  end
+
+  def free_ok
+    @free_ok || plan_id_was == Plan.find_by_stripe_id("free").id
+  end
+
+  attr_writer :free_ok
+
+  def plan_type_valid
+    valid_plans = if free_ok
+      Plan.all.pluck(:id)
+    else
+      Plan.where(price_tier: price_tier).where.not(stripe_id: ["free", "app-subscription", "podcast-subscription"]).pluck(:id)
+    end
+
+    valid_plans.append(plan_id_was)
+
+    unless valid_plans.include?(plan.id)
+      errors.add(:plan_id, "is invalid")
+    end
+  end
+
+  def available_plans
+    plan_stripe_id = plan.stripe_id
+    if plan_stripe_id == "trial"
+      Plan.where(price_tier: price_tier, stripe_id: ["basic-monthly", "basic-yearly", "basic-monthly-2", "basic-yearly-2", "basic-monthly-3", "basic-yearly-3", "basic-monthly-4", "basic-yearly-4"]).order("price DESC")
+    elsif plan_stripe_id == "free"
+      Plan.where(price_tier: price_tier)
+    else
+      exclude = ["free", "trial", "timed", "app-subscription", "podcast-subscription"]
+      Plan.where(price_tier: price_tier).where.not(stripe_id: exclude)
+    end
+  end
+
+  def timed_plan_expired?
+    timed_plan? && expires_at.past?
+  end
+
+  def timed_plan?
+    plan.stripe_id == "timed"
+  end
+
+  def app_plan?
+    plan.stripe_id == "app-subscription"
+  end
+
+  def trial_plan?
+    plan.stripe_id == "trial"
+  end
+
+  def trial_plan_valid
+    return if free_ok == true
+    trial_plan = Plan.find_by_stripe_id("trial")
+    if plan_id == trial_plan.id && plan_id_was != trial_plan.id && !plan_id_was.nil?
+      errors.add(:plan_id, "is invalid")
+    end
+  end
+
+  def changed_password
+    if password_digest_changed? && !old_password_valid
+      errors.add(:old_password, "is incorrect")
+    end
+  end
+
+  def reset_auth_token
+    if update_auth_token
+      generate_token(:auth_token)
+    end
+  end
+
+  def generate_token(column, length = nil, hash = false)
+    begin
+      random_string = SecureRandom.hex(length)
+      self[column] = if hash
+        Digest::SHA1.hexdigest(random_string)
+      else
+        random_string
+      end
+    end while User.exists?(column => self[column])
+    random_string
+  end
+
+  def send_password_reset
+    token = generate_token(:password_reset_token, nil, true)
+    self.password_reset_sent_at = Time.now
+    save!
+    UserMailer.password_reset(id, token).deliver_later
+  end
+
+  def create_customer
+    @stripe_customer = Customer.create(email, plan.stripe_id, trial_end)
+    self.customer_id = @stripe_customer.id
+    if coupon_code
+      coupon_record = Coupon.find_by_coupon_code(coupon_code)
+      coupon_record.update(redeemed: true)
+      self.coupon = coupon_record
+    end
+  end
+
+  def update_billing
+    if email_changed?
+      stripe_customer.update_email(email)
+    end
+
+    if stripe_token.present?
+      stripe_customer.update_payment_method(stripe_token)
+      self.suspended = false
+      subscriptions.update_all(active: true)
+    end
+
+    if plan_id_changed?
+      stripe_customer.update_plan(plan.stripe_id, trial_end)
+    end
+
+    self.stripe_token = nil
+  rescue Stripe::StripeError => exception
+    ErrorService.notify(exception)
+    errors.add :base, billing_error_message(exception)
+    self.stripe_token = nil
+    throw(:abort)
+  end
+
+  # These errors reach the customer as a flash message, so only CardError is
+  # repeated verbatim — Stripe writes those to be read ("Your card was declined").
+  # Every other message is API diagnostics: "No such PaymentMethod: 'pm_…'", or a
+  # masked key from an authentication_error. That belongs in the error report.
+  def billing_error_message(exception)
+    if exception.is_a?(Stripe::CardError)
+      exception.message.to_s
+    else
+      "Your billing information could not be updated. Please try again."
+    end
+  end
+
+  def stripe_customer
+    @stripe_customer ||= Customer.retrieve(customer_id)
+  end
+
+  def cancel_billing
+    customer = Stripe::Customer.retrieve(customer_id)
+    customer.delete
+  rescue Stripe::StripeError => e
+    logger.error "Stripe Error: " + e.message
+    errors.add :base, "#{e.message}."
+    CancelBilling.perform_async(customer_id)
+  end
+
+  def tag_group
+    unique_tags = feed_tags
+    feeds_by_tag = build_feeds_by_tag
+    feeds_by_id = feeds.includes(*Feed::ICON_PRELOADS).include_user_title
+    feeds_by_id = feeds_by_id.each_with_object({}) { |feed, hash|
+      hash[feed.id] = feed
+    }
+
+    unique_tags.map do |tag|
+      feed_ids = feeds_by_tag[tag.id] || []
+      user_feeds = feeds_by_id.values_at(*feed_ids).compact
+      tag.user_feeds = user_feeds.sort_by { |feed| feed.title.try(:downcase) }
+      tag
+    end
+
+    unique_tags
+  end
+
+  def tags_on_feed
+    names = tag_names
+    build_tags_by_feed.each_with_object({}) do |(feed_id, tag_ids), hash|
+      hash[feed_id] = tag_ids.map { |tag_id| names[tag_id] }
+    end
+  end
+
+  def feed_order
+    feeds.include_user_title.map { |feed| feed.id }
+  end
+
+  def subscribed_to?(feed_id)
+    subscriptions.where(feed_id: feed_id).exists? || podcast_subscriptions.where(feed_id: feed_id).exists?
+  end
+
+  def self.search(query)
+    where("email like ?", "%#{query}%")
+  end
+
+  def days_left
+    now = Time.now.to_i
+    seconds_left = trial_end.to_i - now
+    days = (seconds_left.to_f / 86400.to_f).ceil
+    days > 0 ? days : 0
+  end
+
+  def trial_end
+    @trial_end ||= begin
+      expires_at || Time.now + Feedbin::Application.config.trial_days.days
+    end
+  end
+
+  def update_tag_visibility(tag, visible)
+    tag_visibility_will_change!
+    tag_visibility[tag] = visible
+    update tag_visibility: tag_visibility
+  end
+
+  def build_feeds_by_tag
+    query = <<-eos
+      SELECT
+        tag_id, array_to_json(array_agg(DISTINCT feed_id)) as feed_ids
+      FROM
+        taggings
+      WHERE user_id = ? AND feed_id IN (?)
+      GROUP BY tag_id
+    eos
+    query = ActiveRecord::Base.send(:sanitize_sql_array, [query, id, subscriptions.default.pluck(:feed_id)])
+    results = ActiveRecord::Base.connection.execute(query)
+    results.each_with_object({}) do |result, hash|
+      hash[result["tag_id"].to_i] = JSON.parse(result["feed_ids"])
+    end
+  end
+
+  def build_tags_by_feed
+    query = <<-eos
+      SELECT
+        feed_id, array_to_json(array_agg(DISTINCT tag_id)) as tag_ids
+      FROM
+        taggings
+      WHERE user_id = ? AND feed_id IN (?)
+      GROUP BY feed_id
+    eos
+    query = ActiveRecord::Base.send(:sanitize_sql_array, [query, id, subscriptions.pluck(:feed_id)])
+    results = ActiveRecord::Base.connection.execute(query)
+    results.each_with_object({}) do |result, hash|
+      hash[result["feed_id"].to_i] = JSON.parse(result["tag_ids"])
+    end
+  end
+
+  def create_deleted_user
+    DeletedUser.create(email: email, customer_id: customer_id, original_user_id: id)
+  end
+
+  def record_stats
+    if plan.stripe_id == "trial"
+      Librato.increment("user.trial", source: "cancel")
+    else
+      Librato.increment("user.paid", source: "cancel")
+    end
+  end
+
+  # Collects the entries whose counter caches this destroy will invalidate.
+  # Runs before any row is deleted; see the callback declaration. Batched, so
+  # an account holding millions of rows never materialises them all at once.
+  def capture_counter_cache_targets
+    @counter_cache_entry_ids = nil
+    @counter_cache_feed_ids = nil
+
+    entry_ids = Set.new
+    [starred_entries, recently_played_entries, queued_entries].each do |relation|
+      relation.select(:entry_id).in_batches(of: 10_000) do |batch|
+        entry_ids.merge(batch.pluck(:entry_id))
+        next if entry_ids.size <= self.class.counter_cache_id_limit
+
+        # Too many to carry. Drop them and fall back to the feeds.
+        @counter_cache_feed_ids = counter_cache_feed_ids
+        return true
+      end
+    end
+
+    @counter_cache_entry_ids = entry_ids.to_a
+    true
+  end
+
+  # recently_played_entries carries no feed_id, so its feeds come through the
+  # entry.
+  def counter_cache_feed_ids
+    (
+      starred_entries.distinct.pluck(:feed_id) |
+      queued_entries.distinct.pluck(:feed_id) |
+      recently_played_entries.joins(:entry).distinct.pluck("entries.feed_id")
+    ).compact
+  end
+
+  def repair_entry_counter_caches
+    if @counter_cache_feed_ids
+      EntryCounterRepair::ForFeeds.enqueue(@counter_cache_feed_ids)
+    else
+      EntryCounterRepair.enqueue(@counter_cache_entry_ids)
+    end
+  end
+
+  def billing_issue!
+    update(billing_issue: "1")
+  end
+
+  def activate
+    update(suspended: false, billing_issue: "0")
+    subscriptions.update_all(active: true)
+    Search::PercolateCreate.for_users(id)
+  end
+
+  def deactivate
+    update(suspended: true)
+    subscriptions.update_all(active: false)
+    Search::PercolateDestroy.for_users(id)
+  end
+
+  def active?
+    !suspended
+  end
+
+  def admin?
+    admin
+  end
+
+  def newsletter_address
+    if newsletter_authentication_token
+      "#{newsletter_authentication_token.token}@#{ENV["NEWSLETTER_ADDRESS_HOST"]}"
+    else
+      ""
+    end
+  end
+
+  def newsletter_authentication_token
+    authentication_tokens.newsletters.active.order(created_at: :desc).take
+  end
+
+  def newsletter_addresses
+    authentication_tokens.newsletters.active
+  end
+
+  def inactive_newsletter_addresses
+    authentication_tokens.newsletters.where(active: false)
+  end
+
+  def stripe_url
+    "https://manage.stripe.com/customers/#{customer_id}"
+  end
+
+  def deleted?
+    deleted || false
+  end
+
+  def can_read_feed?(feed)
+    can_read = false
+    if feed.respond_to?(:id)
+      feed = feed.id
+    end
+
+    if subscribed_to?(feed)
+      can_read = true
+    end
+
+    if !can_read && starred_entries.where(feed_id: feed).exists?
+      can_read = true
+    end
+
+    can_read
+  end
+
+  def can_read_entry?(entry_id)
+    can_read = false
+
+    entry = Entry.find(entry_id)
+
+    if subscribed_to?(entry.feed)
+      can_read = true
+    end
+
+    if !can_read && starred_entries.where(entry: entry).exists?
+      can_read = true
+    end
+
+    if !can_read && recently_read_entries.where(entry: entry).exists?
+      can_read = true
+    end
+
+    if !can_read && recently_played_entries.where(entry: entry).exists?
+      can_read = true
+    end
+
+    if !can_read && queued_entries.where(entry: entry).exists?
+      can_read = true
+    end
+
+    can_read
+  end
+
+  def combined_sharing_services
+    (sharing_services + supported_sharing_services)
+      .select  { |sharing_service| sharing_service.active?    }
+      .sort_by { |sharing_service| sharing_service.label      }
+      .map     { |sharing_service| sharing_service.share_link }
+      .compact
+  end
+
+  def can_read_filter(requested_ids)
+    allowed_ids = []
+
+    feed_ids = subscriptions.pluck(:feed_id)
+
+    ids = Entry.where(feed_id: feed_ids, id: requested_ids).pluck(:id)
+    allowed_ids = allowed_ids.push(ids).flatten
+
+    if requested_ids.length != allowed_ids.length
+      ids = starred_entries.where(entry_id: requested_ids).pluck(:entry_id)
+      allowed_ids = allowed_ids.push(ids).flatten
+    end
+
+    if requested_ids.length != allowed_ids.length
+      ids = recently_read_entries.where(entry_id: requested_ids).pluck(:entry_id)
+      allowed_ids = allowed_ids.push(ids).flatten
+    end
+
+    if requested_ids.length != allowed_ids.length
+      ids = recently_played_entries.where(entry_id: requested_ids).pluck(:entry_id)
+      allowed_ids = allowed_ids.push(ids).flatten
+    end
+
+    if requested_ids.length != allowed_ids.length
+      ids = queued_entries.where(entry_id: requested_ids).pluck(:entry_id)
+      allowed_ids = allowed_ids.push(ids).flatten
+    end
+
+    allowed_ids.uniq
+  end
+
+  def trialing?
+    plan == Plan.find_by_stripe_id("trial")
+  end
+
+  def subscriptions_hash
+    Digest::SHA1.hexdigest(subscription_ids.join)
+  end
+
+  def migrate_playlists!
+    return unless playlist_migration.nil?
+
+    migrate_playlist!(title: "Subscriptions", subs: podcast_subscriptions.subscribed)
+    migrate_playlist!(title: "Bookmarks", subs: podcast_subscriptions.bookmarked)
+    update(playlist_migration: 1)
+  end
+
+  def migrate_playlist!(title:, subs:)
+    return unless subs.exists?
+
+    playlist = playlists.create_or_find_by(title: title)
+    subs.update_all(playlist_id: playlist.id)
+    queued_entries.where(feed_id: subs.pluck(:feed_id)).update_all(playlist_id: playlist.id)
+  end
+
+  def recently_played_entries_progress
+    (queued_entries + recently_played_entries).each_with_object({}) do |item, hash|
+      progress = item.progress
+      if existing = hash[item.entry_id]
+        progress = [existing[:progress], progress].max
+      end
+      hash[item.entry_id] = {progress: progress, duration: item.duration}
+    end
+  end
+
+  # Subscriptions matching the given feeds, keyed by feed id and by redirect
+  # url. The redirect key covers subscribing to a feed that later redirected to
+  # one of the feeds being searched: that feed still counts as subscribed, and
+  # resolves to the subscription actually owned. Callers that only need a yes or
+  # no can check either key, since Hash#include? tests keys.
+  def existing_subscriptions(feeds_to_search)
+    return {} if feeds_to_search.blank?
+    @existing ||= begin
+      matching = Feed.where(id: feeds_to_search.map(&:id)).or(Feed.where(redirected_to: feeds_to_search.map(&:feed_url)))
+      subscriptions.where(feed: matching).includes(:feed).each_with_object({}) do |subscription, hash|
+        hash[subscription.feed_id] = subscription
+        if (redirect = subscription.feed.redirected_to).present?
+          hash[redirect] = subscription
+        end
+      end
+    end
+  end
+end

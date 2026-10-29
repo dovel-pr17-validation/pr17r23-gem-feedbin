@@ -1,0 +1,11 @@
+---
+api_key: <%= ENV['HONEYBADGER_API_KEY'] %>
+connection:
+  host: <%= ENV['HONEYBADGER_CONNECTION_HOST'] %>
+  system_ssl_cert_chain: true
+exceptions:
+  local_variables: true
+breadcrumbs:
+  enabled: false
+insights:
+  enabled: false
